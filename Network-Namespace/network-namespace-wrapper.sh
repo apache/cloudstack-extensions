@@ -349,6 +349,7 @@ pub_veth_ns_name() {
 nat_chain()    { echo "${CHAIN_PREFIX}_${1}"; }
 filter_chain()   { echo "${CHAIN_PREFIX}_FWD_${1}"; }
 firewall_chain() { echo "${CHAIN_PREFIX}_FWRULES_${1}"; }
+acl_chain()      { echo "${CHAIN_PREFIX}_ACL_${1}"; }
 
 ensure_public_ip_on_namespace() {
     local public_ip="$1" public_cidr="$2" pveth_n="$3" pveth_h="$4" addr_spec prefix
@@ -460,10 +461,15 @@ parse_args() {
     LB_RULES_JSON="[]"
     DEFAULT_NIC="true"
     VM_DATA=""
+    VM_DATA_FILE=""
     DOMAIN=""
     EXTENSION_IP=""
     RESTORE_DATA=""
+    RESTORE_DATA_FILE=""
     FW_RULES_JSON=""
+    FW_RULES_FILE=""
+    ACL_RULES_JSON=""
+    ACL_RULES_FILE=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -495,10 +501,15 @@ parse_args() {
             --lb-rules)            LB_RULES_JSON="$2";       shift 2 ;;
             --default-nic)         DEFAULT_NIC="$2";         shift 2 ;;
             --vm-data)             VM_DATA="$2";             shift 2 ;;
+            --vm-data-file)        VM_DATA_FILE="$2";        shift 2 ;;
             --domain)              DOMAIN="$2";              shift 2 ;;
             --extension-ip)        EXTENSION_IP="$2";        shift 2 ;;
             --restore-data)        RESTORE_DATA="$2";        shift 2 ;;
+            --restore-data-file)   RESTORE_DATA_FILE="$2";   shift 2 ;;
             --fw-rules)            FW_RULES_JSON="$2";       shift 2 ;;
+            --fw-rules-file)       FW_RULES_FILE="$2";       shift 2 ;;
+            --acl-rules)           ACL_RULES_JSON="$2";      shift 2 ;;
+            --acl-rules-file)      ACL_RULES_FILE="$2";      shift 2 ;;
             # consumed by _pre_scan_args — skip silently
             --physical-network-extension-details|--network-extension-details)
                                    shift 2 ;;
@@ -577,7 +588,7 @@ _load_state() {
 }
 
 ##############################################################################
-# Command: implement
+# Command: implement-network
 #
 # 1. Create namespace cs-net-<id>
 # 2. Create host bridge br<ethX>-<vlan> with ethX.<vlan> sub-interface
@@ -586,11 +597,11 @@ _load_state() {
 # 5. Set up iptables chains inside namespace
 ##############################################################################
 
-cmd_implement() {
+cmd_implement_network() {
     parse_args "$@"
     acquire_lock "${NETWORK_ID}"
 
-    log "implement: network=${NETWORK_ID} ns=${NAMESPACE} vlan=${VLAN} gw=${GATEWAY} cidr=${CIDR}"
+    log "implement-network: network=${NETWORK_ID} ns=${NAMESPACE} vlan=${VLAN} gw=${GATEWAY} cidr=${CIDR}"
 
     local veth_h veth_n nchain_pr nchain_post fchain
     veth_h=$(veth_host_name "${VLAN}" "${CHOSEN_ID}")
@@ -706,22 +717,22 @@ cmd_implement() {
 
     _dump_iptables "${NAMESPACE}"
     release_lock
-    log "implement: done network=${NETWORK_ID} namespace=${NAMESPACE}"
+    log "implement-network: done network=${NETWORK_ID} namespace=${NAMESPACE}"
 }
 
 ##############################################################################
-# Command: shutdown
+# Command: shutdown-network
 # Flush iptables chains and remove this network's veth pairs.
 # For VPC networks the shared namespace is preserved (other tiers still use it).
 # For isolated networks the namespace is also removed.
 ##############################################################################
 
-cmd_shutdown() {
+cmd_shutdown_network() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    log "shutdown: network=${NETWORK_ID} ns=${NAMESPACE} vpc=${VPC_ID}"
+    log "shutdown-network: network=${NETWORK_ID} ns=${NAMESPACE} vpc=${VPC_ID}"
 
     local nchain_pr nchain_post fchain
     nchain_pr="${CHAIN_PREFIX}_${NETWORK_ID}_PR"
@@ -752,7 +763,7 @@ cmd_shutdown() {
             if [ -f "${tier_f}" ]; then
                 local owner_tier; owner_tier=$(cat "${tier_f}" 2>/dev/null || true)
                 if [ -n "${owner_tier}" ] && [ "${owner_tier}" != "${NETWORK_ID}" ]; then
-                    log "shutdown: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
+                    log "shutdown-network: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
                     continue
                 fi
             fi
@@ -760,7 +771,7 @@ cmd_shutdown() {
             pvlan=$(cat "${f}")
             pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
             ip link del "${pveth_h}" 2>/dev/null || true
-            log "shutdown: removed public veth ${pveth_h}"
+            log "shutdown-network: removed public veth ${pveth_h}"
         done
     fi
 
@@ -768,7 +779,7 @@ cmd_shutdown() {
     local veth_h
     veth_h=$(veth_host_name "${VLAN}" "${CHOSEN_ID}")
     ip link del "${veth_h}" 2>/dev/null || true
-    log "shutdown: removed guest veth ${veth_h}"
+    log "shutdown-network: removed guest veth ${veth_h}"
 
     # Clean transient public IP state.
     # For isolated networks the state dir is per-network, so wipe it entirely.
@@ -791,28 +802,28 @@ cmd_shutdown() {
     # across tiers and must only be deleted when the last tier is destroyed.
     if [ -z "${VPC_ID}" ]; then
         ip netns del "${NAMESPACE}" 2>/dev/null || true
-        log "shutdown: deleted namespace ${NAMESPACE}"
+        log "shutdown-network: deleted namespace ${NAMESPACE}"
     else
-        log "shutdown: preserved shared namespace ${NAMESPACE} (VPC tier)"
+        log "shutdown-network: preserved shared namespace ${NAMESPACE} (VPC tier)"
     fi
 
     release_lock
-    log "shutdown: done network=${NETWORK_ID}"
+    log "shutdown-network: done network=${NETWORK_ID}"
 }
 
 ##############################################################################
-# Command: destroy
+# Command: destroy-network
 # Delete this network's state entirely.
-# For VPC networks the shared namespace is only deleted when this is the last
-# remaining tier (tracked via vpc-<vpcId>/tiers/<networkId> marker files).
+# For VPC tier networks the shared namespace is preserved — the namespace is
+# removed only when shutdownVpc() calls shutdown-vpc or destroy-vpc.
 ##############################################################################
 
-cmd_destroy() {
+cmd_destroy_network() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    log "destroy: network=${NETWORK_ID} ns=${NAMESPACE} vpc=${VPC_ID}"
+    log "destroy-network: network=${NETWORK_ID} ns=${NAMESPACE} vpc=${VPC_ID}"
 
     # Remove this tier's guest veth host-side
     local veth_h
@@ -831,7 +842,7 @@ cmd_destroy() {
             if [ -f "${tier_f}" ]; then
                 local owner_tier; owner_tier=$(cat "${tier_f}" 2>/dev/null || true)
                 if [ -n "${owner_tier}" ] && [ "${owner_tier}" != "${NETWORK_ID}" ]; then
-                    log "destroy: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
+                    log "destroy-network: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
                     continue
                 fi
             fi
@@ -855,29 +866,18 @@ cmd_destroy() {
     # Deregister this tier from VPC tracking
     if [ -n "${VPC_ID}" ]; then
         rm -f "${vsd}/tiers/${NETWORK_ID}" 2>/dev/null || true
-        # Only delete the VPC-wide namespace and state when no more tiers remain
-        local remaining_tiers
-        remaining_tiers=$(find "${vsd}/tiers/" -type f 2>/dev/null | wc -l)
-        if [ "${remaining_tiers}" -le 0 ]; then
-            if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
-                ip netns del "${NAMESPACE}"
-                log "destroy: deleted shared namespace ${NAMESPACE} (last VPC tier)"
-            fi
-            rm -rf "${vsd}"
-            log "destroy: removed VPC state dir ${vsd}"
-        else
-            log "destroy: preserved namespace ${NAMESPACE} (${remaining_tiers} tier(s) remaining)"
-        fi
+        # The VPC namespace is managed by shutdown-vpc / destroy-vpc — do NOT delete it here.
+        log "destroy-network: deregistered tier ${NETWORK_ID} from VPC ${VPC_ID} (namespace preserved)"
     else
         # Isolated network: delete the namespace directly
         if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
             ip netns del "${NAMESPACE}"
-            log "destroy: deleted namespace ${NAMESPACE}"
+            log "destroy-network: deleted namespace ${NAMESPACE}"
         fi
     fi
 
     release_lock
-    log "destroy: done network=${NETWORK_ID}"
+    log "destroy-network: done network=${NETWORK_ID}"
 }
 
 ##############################################################################
@@ -961,7 +961,9 @@ cmd_assign_ip() {
     fi
 
     # ---- Source NAT ----
-    if [ "${SOURCE_NAT}" = "true" ] && [ -n "${CIDR}" ]; then
+    # For VPC tiers the SNAT rule covers the entire VPC CIDR and is set up by
+    # implement-vpc (using --vpc-cidr).  Duplicate SNAT rules here would conflict.
+    if [ "${SOURCE_NAT}" = "true" ] && [ -n "${CIDR}" ] && [ -z "${VPC_ID}" ]; then
         ip netns exec "${NAMESPACE}" iptables -t nat \
             -C "${nchain_post}" -s "${CIDR}" -o "${pveth_n}" -j SNAT --to-source "${PUBLIC_IP}" 2>/dev/null || \
         ip netns exec "${NAMESPACE}" iptables -t nat \
@@ -971,6 +973,8 @@ cmd_assign_ip() {
         ip netns exec "${NAMESPACE}" iptables -t filter \
             -A "${fchain}" -o "${pveth_n}" -s "${CIDR}" -j ACCEPT
         log "Source NAT: ${CIDR} -> ${PUBLIC_IP} via ${pveth_n}"
+    elif [ "${SOURCE_NAT}" = "true" ] && [ -n "${VPC_ID}" ]; then
+        log "assign-ip: skipping SNAT rules for VPC tier (managed by implement-vpc)"
     fi
 
     # ---- Persist state ----
@@ -2231,20 +2235,36 @@ cmd_save_vm_data() {
     acquire_lock "${NETWORK_ID}"
     log "save-vm-data: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ]   && die "save-vm-data: missing --ip"
-    [ -z "${VM_DATA}" ] && die "save-vm-data: missing --vm-data"
+
+    local vm_data_file="${VM_DATA_FILE}"
+    local cleanup_vm_data_file="false"
+    if [ -z "${vm_data_file}" ]; then
+        [ -z "${VM_DATA}" ] && die "save-vm-data: missing --vm-data or --vm-data-file"
+        vm_data_file=$(mktemp /tmp/cs-extnet-vm-data-XXXXXX)
+        cleanup_vm_data_file="true"
+        printf '%s' "${VM_DATA}" > "${vm_data_file}"
+    fi
+    [ -f "${vm_data_file}" ] || die "save-vm-data: payload file not found: ${vm_data_file}"
 
     local meta_dir; meta_dir=$(_metadata_dir)
     local passwd_f; passwd_f=$(_passwd_file)
     mkdir -p "${meta_dir}" "$(dirname "${passwd_f}")"
     touch "${passwd_f}"
 
-    python3 - "${VM_IP}" "${meta_dir}" "${passwd_f}" "${VM_DATA}" << 'PYEOF'
+    python3 - "${VM_IP}" "${meta_dir}" "${passwd_f}" "${vm_data_file}" << 'PYEOF'
 import base64, json, os, sys
 
 vm_ip      = sys.argv[1]
 meta_dir   = sys.argv[2]
 passwd_f   = sys.argv[3]
-data_b64   = sys.argv[4]
+data_file  = sys.argv[4]
+
+try:
+    with open(data_file, 'r', encoding='utf-8') as f:
+        data_b64 = f.read().strip()
+except Exception as e:
+    print(f"save-vm-data: failed to read vm-data file: {e}", file=sys.stderr)
+    sys.exit(1)
 
 # Decode the outer base64 wrapper, then parse the JSON array
 try:
@@ -2321,6 +2341,10 @@ if password_written:
 print(f"save-vm-data: wrote {len(entries)} entries for {vm_ip}")
 PYEOF
 
+    if [ "${cleanup_vm_data_file}" = "true" ]; then
+        rm -f "${vm_data_file}" 2>/dev/null || true
+    fi
+
     _write_apache2_conf
     _svc_start_or_reload_apache2
     _svc_start_or_reload_passwd_server
@@ -2389,6 +2413,15 @@ cmd_apply_fw_rules() {
     acquire_lock "${NETWORK_ID}"
     log "apply-fw-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
+    local fw_rules_file="${FW_RULES_FILE}"
+    local cleanup_fw_rules_file="false"
+    if [ -z "${fw_rules_file}" ]; then
+        fw_rules_file=$(mktemp /tmp/cs-extnet-fw-rules-XXXXXX)
+        cleanup_fw_rules_file="true"
+        printf '%s' "${FW_RULES_JSON:-}" > "${fw_rules_file}"
+    fi
+    [ -f "${fw_rules_file}" ] || die "apply-fw-rules: payload file not found: ${fw_rules_file}"
+
     local veth_n fchain fw_chain
     veth_n=$(veth_ns_name "${VLAN}" "${CHOSEN_ID}")
     fchain=$(filter_chain "${NETWORK_ID}")
@@ -2406,14 +2439,21 @@ cmd_apply_fw_rules() {
     ip netns exec "${NAMESPACE}" iptables -t filter -N "${fw_chain}"
 
     # ---- 4. Build iptables rules via Python ----
-    python3 - "${NAMESPACE}" "${FW_RULES_JSON:-}" "${veth_n}" \
+    python3 - "${NAMESPACE}" "${fw_rules_file}" "${veth_n}" \
               "${fw_chain}" << 'PYEOF'
 import base64, json, re, subprocess, sys
 
 namespace = sys.argv[1]
-rules_b64 = sys.argv[2]
+rules_file = sys.argv[2]
 veth_n    = sys.argv[3]
 fw_chain  = sys.argv[4]   # filter table egress chain (CS_EXTNET_FWRULES_<N>)
+
+try:
+    with open(rules_file, 'r', encoding='utf-8') as f:
+        rules_b64 = f.read().strip()
+except Exception as e:
+    print(f"apply-fw-rules: failed to read rules file: {e}", file=sys.stderr)
+    sys.exit(1)
 
 # Prefix for per-public-IP ingress chains in the mangle table.
 # e.g. CS_EXTNET_FWI_10.0.56.20
@@ -2592,6 +2632,11 @@ print(f"apply-fw-rules: built {n_in} ingress rule(s) across {len(pub_ip_rules)} 
 PYEOF
 
     local py_exit=$?
+
+    if [ "${cleanup_fw_rules_file}" = "true" ]; then
+        rm -f "${fw_rules_file}" 2>/dev/null || true
+    fi
+
     if [ ${py_exit} -ne 0 ]; then
         # Python script failed — leave chain empty but continue so that the
         # fchain catch-all rules remain effective (fail-open for existing traffic).
@@ -2768,7 +2813,16 @@ cmd_restore_network() {
     _load_state
     acquire_lock "${NETWORK_ID}"
     log "restore-network: network=${NETWORK_ID} ns=${NAMESPACE}"
-    [ -z "${RESTORE_DATA}" ] && die "restore-network: missing --restore-data"
+
+    local restore_data_file="${RESTORE_DATA_FILE}"
+    local cleanup_restore_data_file="false"
+    if [ -z "${restore_data_file}" ]; then
+        [ -z "${RESTORE_DATA}" ] && die "restore-network: missing --restore-data or --restore-data-file"
+        restore_data_file=$(mktemp /tmp/cs-extnet-restore-data-XXXXXX)
+        cleanup_restore_data_file="true"
+        printf '%s' "${RESTORE_DATA}" > "${restore_data_file}"
+    fi
+    [ -f "${restore_data_file}" ] || die "restore-network: payload file not found: ${restore_data_file}"
 
     local dhcp_hosts; dhcp_hosts=$(_dnsmasq_dhcp_hosts)
     local dhcp_opts;  dhcp_opts=$(_dnsmasq_dhcp_opts)
@@ -2780,18 +2834,25 @@ cmd_restore_network() {
     touch "${dhcp_hosts}" "${dhcp_opts}" "${dns_hosts}" "${passwd_f}"
 
     python3 - \
-        "${RESTORE_DATA}" \
+        "${restore_data_file}" \
         "${dhcp_hosts}" "${dhcp_opts}" "${dns_hosts}" \
         "${meta_dir}" "${passwd_f}" \
         << 'PYEOF'
 import base64, json, os, sys
 
-restore_b64  = sys.argv[1]
+restore_file = sys.argv[1]
 dhcp_hosts_f = sys.argv[2]
 dhcp_opts_f  = sys.argv[3]
 dns_hosts_f  = sys.argv[4]
 meta_dir     = sys.argv[5]
 passwd_f     = sys.argv[6]
+
+try:
+    with open(restore_file, 'r', encoding='utf-8') as f:
+        restore_b64 = f.read().strip()
+except Exception as e:
+    print(f"restore-network: failed to read restore-data file: {e}", file=sys.stderr)
+    sys.exit(1)
 
 # ---- Decode the outer base64, then parse JSON ----
 try:
@@ -2938,16 +2999,16 @@ print("restore-network: done")
 PYEOF
 
     # ------------------------------------------------------------------
-    # Decode dhcp_enabled / dns_enabled from RESTORE_DATA so we can
+    # Decode dhcp_enabled / dns_enabled from restore_data_file so we can
     # reconfigure dnsmasq correctly even when the namespace (and therefore
-    # dnsmasq.conf) was deleted and recreated.  RESTORE_DATA is passed as
-    # a positional argument to avoid shell-quoting issues with base64 data.
+    # dnsmasq.conf) was deleted and recreated.
     # ------------------------------------------------------------------
     local _r_flags
-    _r_flags=$(python3 - "${RESTORE_DATA}" 2>/dev/null << 'PYFLAGSEOF'
-import base64, json, sys
+    _r_flags=$(python3 - "${restore_data_file}" 2>/dev/null << 'PYFLAGSEOF'
+import base64, json, sys, pathlib
 try:
-    d = json.loads(base64.b64decode(sys.argv[1]).decode('utf-8'))
+    b64_data = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+    d = json.loads(base64.b64decode(b64_data).decode('utf-8'))
     dhcp = 'true' if d.get('dhcp_enabled', False) else 'false'
     dns  = 'true' if d.get('dns_enabled',  False) else 'false'
     print(dhcp + ' ' + dns)
@@ -2955,6 +3016,10 @@ except Exception:
     print('false false')
 PYFLAGSEOF
 )
+
+    if [ "${cleanup_restore_data_file}" = "true" ]; then
+        rm -f "${restore_data_file}" 2>/dev/null || true
+    fi
     local _r_dhcp _r_dns
     _r_dhcp="${_r_flags%% *}"; _r_dhcp="${_r_dhcp:-false}"
     _r_dns="${_r_flags##* }";  _r_dns="${_r_dns:-false}"
@@ -2990,6 +3055,344 @@ PYFLAGSEOF
 }
 
 ##############################################################################
+# Helpers: parse VPC-level args (no --network-id required)
+##############################################################################
+
+parse_vpc_args() {
+    VPC_ID=""
+    NAMESPACE=""
+    VPC_CIDR=""
+    PUBLIC_IP=""
+    PUBLIC_VLAN=""
+    PUBLIC_GATEWAY=""
+    PUBLIC_CIDR=""
+    SOURCE_NAT="false"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --vpc-id)              VPC_ID="$2";          shift 2 ;;
+            --namespace)           NAMESPACE="$2";        shift 2 ;;
+            --cidr)                VPC_CIDR="$2";         shift 2 ;;
+            --public-ip)           PUBLIC_IP="$2";        shift 2 ;;
+            --public-vlan)         PUBLIC_VLAN="$2";      shift 2 ;;
+            --public-gateway)      PUBLIC_GATEWAY="$2";   shift 2 ;;
+            --public-cidr)         PUBLIC_CIDR="$2";      shift 2 ;;
+            --source-nat)          SOURCE_NAT="$2";       shift 2 ;;
+            # consumed by _pre_scan_args — skip silently
+            --physical-network-extension-details|--network-extension-details)
+                                   shift 2 ;;
+            *)                     shift ;;
+        esac
+    done
+
+    [ -z "${VPC_ID}" ] && die "Missing --vpc-id"
+
+    if [ -z "${NAMESPACE}" ]; then
+        local NS_FROM_DETAILS
+        NS_FROM_DETAILS=$(_json_get "${EXTENSION_DETAILS}" "namespace")
+        NAMESPACE="${NS_FROM_DETAILS:-cs-vpc-${VPC_ID}}"
+    fi
+
+    # Normalise VLANs
+    if [ -n "${PUBLIC_VLAN}" ]; then
+        PUBLIC_VLAN=$(normalize_vlan "${PUBLIC_VLAN}")
+    fi
+}
+
+##############################################################################
+# Command: implement-vpc
+# Creates the VPC namespace, enables IP forwarding, and optionally sets up
+# VPC-level source NAT (--public-ip / --public-vlan / --source-nat true).
+# State is persisted to ${STATE_DIR}/vpc-<vpcId>/
+##############################################################################
+
+cmd_implement_vpc() {
+    parse_vpc_args "$@"
+    log "implement-vpc: vpc=${VPC_ID} ns=${NAMESPACE} cidr=${VPC_CIDR}"
+
+    # ---- 1. Create (or ensure) VPC namespace ----
+    if ! ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        ip netns add "${NAMESPACE}"
+        log "implement-vpc: created namespace ${NAMESPACE}"
+    fi
+    ip netns exec "${NAMESPACE}" ip link set lo up 2>/dev/null || true
+
+    # Disable IPv6 inside the namespace
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+
+    # ---- 2. IP forwarding ----
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+    # ---- 3. VPC-level source NAT (if source NAT IP provided) ----
+    # Creates the public veth pair and SNAT rule for the entire VPC CIDR.
+    if [ -n "${PUBLIC_IP}" ] && [ -n "${PUBLIC_VLAN}" ] && [ "${SOURCE_NAT}" = "true" ] && [ -n "${VPC_CIDR}" ]; then
+        local pveth_h pveth_n pub_br
+        pveth_h=$(pub_veth_host_name "${PUBLIC_VLAN}" "${VPC_ID}")
+        pveth_n=$(pub_veth_ns_name   "${PUBLIC_VLAN}" "${VPC_ID}")
+        ensure_host_bridge "${PUB_ETH}" "${PUBLIC_VLAN}"
+        pub_br=$(host_bridge_name "${PUB_ETH}" "${PUBLIC_VLAN}")
+
+        if ! ip link show "${pveth_h}" >/dev/null 2>&1; then
+            ip link add "${pveth_h}" type veth peer name "${pveth_n}"
+            ip link set "${pveth_n}" netns "${NAMESPACE}"
+            ip link set "${pveth_h}" master "${pub_br}"
+            ip link set "${pveth_h}" up
+            ip netns exec "${NAMESPACE}" ip link set "${pveth_n}" up
+            log "implement-vpc: created public veth ${pveth_h} <-> ${pveth_n}"
+        else
+            ip link set "${pveth_h}" up 2>/dev/null || true
+            ip netns exec "${NAMESPACE}" ip link set "${pveth_n}" up 2>/dev/null || true
+        fi
+
+        # Assign public IP
+        local ADDR_SPEC
+        if [ -n "${PUBLIC_CIDR}" ] && echo "${PUBLIC_CIDR}" | grep -q '/'; then
+            local PREFIX
+            PREFIX=$(echo "${PUBLIC_CIDR}" | cut -d'/' -f2)
+            ADDR_SPEC="${PUBLIC_IP}/${PREFIX}"
+        else
+            ADDR_SPEC="${PUBLIC_IP}/32"
+        fi
+        ip netns exec "${NAMESPACE}" ip addr show "${pveth_n}" 2>/dev/null | \
+            grep -q "${PUBLIC_IP}/" || \
+            ip netns exec "${NAMESPACE}" ip addr add "${ADDR_SPEC}" dev "${pveth_n}"
+
+        # Host route
+        ip route show | grep -q "^${PUBLIC_IP}" || \
+            ip route add "${PUBLIC_IP}/32" dev "${pveth_h}" 2>/dev/null || true
+
+        # Default route inside namespace toward upstream gateway
+        if [ -n "${PUBLIC_GATEWAY}" ]; then
+            ip netns exec "${NAMESPACE}" ip route replace default \
+                via "${PUBLIC_GATEWAY}" dev "${pveth_n}" 2>/dev/null || \
+            ip netns exec "${NAMESPACE}" ip route add default \
+                via "${PUBLIC_GATEWAY}" dev "${pveth_n}" 2>/dev/null || true
+            log "implement-vpc: default route via ${PUBLIC_GATEWAY} dev ${pveth_n}"
+        fi
+
+        # VPC SNAT rule — covers the entire VPC CIDR (all tiers)
+        # Use a VPC-level POSTROUTING chain: CS_EXTNET_<vpcId>_VPC_POST
+        local vpc_post_chain="${CHAIN_PREFIX}_${VPC_ID}_VPC_POST"
+        ensure_chain nat "${vpc_post_chain}"
+        ensure_jump  nat POSTROUTING "${vpc_post_chain}"
+
+        ip netns exec "${NAMESPACE}" iptables -t nat \
+            -C "${vpc_post_chain}" -s "${VPC_CIDR}" -o "${pveth_n}" -j SNAT --to-source "${PUBLIC_IP}" 2>/dev/null || \
+        ip netns exec "${NAMESPACE}" iptables -t nat \
+            -A "${vpc_post_chain}" -s "${VPC_CIDR}" -o "${pveth_n}" -j SNAT --to-source "${PUBLIC_IP}"
+        log "implement-vpc: VPC SNAT ${VPC_CIDR} -> ${PUBLIC_IP} via ${pveth_n}"
+
+        # Persist public IP state
+        local vsd="${STATE_DIR}/vpc-${VPC_ID}"
+        mkdir -p "${vsd}/ips"
+        echo "true"         > "${vsd}/ips/${PUBLIC_IP}"
+        echo "${PUBLIC_VLAN}" > "${vsd}/ips/${PUBLIC_IP}.pvlan"
+    fi
+
+    # ---- 4. Persist VPC state ----
+    local vsd="${STATE_DIR}/vpc-${VPC_ID}"
+    mkdir -p "${vsd}"
+    echo "${NAMESPACE}" > "${vsd}/namespace"
+    [ -n "${VPC_CIDR}" ] && echo "${VPC_CIDR}" > "${vsd}/cidr"
+
+    log "implement-vpc: done vpc=${VPC_ID} namespace=${NAMESPACE}"
+}
+
+##############################################################################
+# Command: shutdown-vpc
+# Removes the VPC namespace after all tiers have been shut down.
+# Called by shutdownVpc() in NetworkExtensionElement after all tiers are gone.
+##############################################################################
+
+cmd_shutdown_vpc() {
+    parse_vpc_args "$@"
+    log "shutdown-vpc: vpc=${VPC_ID} ns=${NAMESPACE}"
+
+    if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        ip netns del "${NAMESPACE}"
+        log "shutdown-vpc: deleted namespace ${NAMESPACE}"
+    else
+        log "shutdown-vpc: namespace ${NAMESPACE} not found (already removed?)"
+    fi
+
+    log "shutdown-vpc: done vpc=${VPC_ID}"
+}
+
+##############################################################################
+# Command: destroy-vpc
+# Destroys the VPC namespace and removes all VPC state.
+##############################################################################
+
+cmd_destroy_vpc() {
+    parse_vpc_args "$@"
+    log "destroy-vpc: vpc=${VPC_ID} ns=${NAMESPACE}"
+
+    if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        ip netns del "${NAMESPACE}"
+        log "destroy-vpc: deleted namespace ${NAMESPACE}"
+    fi
+
+    local vsd="${STATE_DIR}/vpc-${VPC_ID}"
+    rm -rf "${vsd}"
+    log "destroy-vpc: removed VPC state dir ${vsd}"
+
+    log "destroy-vpc: done vpc=${VPC_ID}"
+}
+
+##############################################################################
+# Command: apply-network-acl
+# Applies VPC network ACL rules to the FORWARD chain inside the namespace.
+# Rules are passed as a Base64-encoded JSON array via --acl-rules-file or
+# --acl-rules.  Each rule has:
+#   number, action (allow|deny), trafficType (ingress|egress),
+#   protocol, portStart, portEnd, icmpType, icmpCode, sourceCidrs[]
+##############################################################################
+
+cmd_apply_network_acl() {
+    parse_args "$@"
+    _load_state
+    acquire_lock "${NETWORK_ID}"
+    log "apply-network-acl: network=${NETWORK_ID} ns=${NAMESPACE} cidr=${CIDR}"
+
+    local acl_rules_file="${ACL_RULES_FILE}"
+    local cleanup_acl_file="false"
+    if [ -z "${acl_rules_file}" ]; then
+        acl_rules_file=$(mktemp /tmp/cs-extnet-acl-rules-XXXXXX)
+        cleanup_acl_file="true"
+        printf '%s' "${ACL_RULES_JSON:-}" > "${acl_rules_file}"
+    fi
+    [ -f "${acl_rules_file}" ] || die "apply-network-acl: payload file not found: ${acl_rules_file}"
+
+    local veth_n acl_chain_name fchain
+    veth_n=$(veth_ns_name "${VLAN}" "${CHOSEN_ID}")
+    acl_chain_name=$(acl_chain "${NETWORK_ID}")
+    fchain=$(filter_chain "${NETWORK_ID}")
+
+    # ---- 1. Remove existing jump from fchain to acl chain (idempotent) ----
+    ip netns exec "${NAMESPACE}" iptables -t filter \
+        -D "${fchain}" -j "${acl_chain_name}" 2>/dev/null || true
+
+    # ---- 2. Flush and delete old ACL chain ----
+    ip netns exec "${NAMESPACE}" iptables -t filter -F "${acl_chain_name}" 2>/dev/null || true
+    ip netns exec "${NAMESPACE}" iptables -t filter -X "${acl_chain_name}" 2>/dev/null || true
+
+    # ---- 3. Create fresh ACL chain ----
+    ip netns exec "${NAMESPACE}" iptables -t filter -N "${acl_chain_name}"
+
+    # ---- 4. Build iptables ACL rules via Python ----
+    python3 - "${NAMESPACE}" "${acl_rules_file}" "${veth_n}" \
+              "${acl_chain_name}" "${CIDR:-}" << 'PYEOF'
+import base64, json, subprocess, sys
+
+namespace    = sys.argv[1]
+rules_file   = sys.argv[2]
+veth_n       = sys.argv[3]
+acl_chain    = sys.argv[4]
+net_cidr     = sys.argv[5]   # tier CIDR (may be empty)
+
+try:
+    with open(rules_file, 'r', encoding='utf-8') as f:
+        rules_b64 = f.read().strip()
+except Exception as e:
+    print(f"apply-network-acl: failed to read rules file: {e}", file=sys.stderr)
+    sys.exit(1)
+
+def _run(table, *args):
+    cmd = ['ip', 'netns', 'exec', namespace, 'iptables', '-t', table] + list(args)
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        print(f"iptables ({table}): {r.stderr.decode().strip()}", file=sys.stderr)
+    return r
+
+def iptf(*args):
+    _run('filter', *args)
+
+if rules_b64:
+    try:
+        rules = json.loads(base64.b64decode(rules_b64).decode('utf-8'))
+    except Exception as e:
+        print(f"apply-network-acl: failed to decode rules: {e}", file=sys.stderr)
+        sys.exit(1)
+else:
+    rules = []
+
+# Always allow RELATED,ESTABLISHED so active sessions are not dropped.
+iptf('-A', acl_chain, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
+
+for rule in sorted(rules, key=lambda r: r.get('number', 999)):
+    direction  = rule.get('trafficType', 'ingress').lower()
+    protocol   = (rule.get('protocol') or 'all').lower()
+    port_start = rule.get('portStart')
+    port_end   = rule.get('portEnd')
+    icmp_type  = rule.get('icmpType')
+    icmp_code  = rule.get('icmpCode')
+    src_cidrs  = rule.get('sourceCidrs') or ['0.0.0.0/0']
+    action     = 'ACCEPT' if rule.get('action', 'deny').lower() == 'allow' else 'DROP'
+
+    for src_cidr in src_cidrs:
+        a = []
+        if direction == 'ingress':
+            # Traffic toward VMs (going OUT on guest veth_n into the tier subnet)
+            a = ['-o', veth_n]
+            if net_cidr:
+                a += ['-d', net_cidr]
+            if src_cidr and src_cidr not in ('0.0.0.0/0', '::/0', ''):
+                a += ['-s', src_cidr]
+        else:
+            # Traffic FROM VMs (coming IN on guest veth_n from the tier subnet)
+            a = ['-i', veth_n]
+            if net_cidr:
+                a += ['-s', net_cidr]
+            # For egress rules sourceCidrs is used as destination filter
+            if src_cidr and src_cidr not in ('0.0.0.0/0', '::/0', ''):
+                a += ['-d', src_cidr]
+
+        if protocol not in ('all', ''):
+            a += ['-p', protocol]
+            if protocol in ('tcp', 'udp') and port_start is not None:
+                port_spec = str(port_start)
+                if port_end is not None and port_end != port_start:
+                    port_spec = f"{port_start}:{port_end}"
+                a += ['--dport', port_spec]
+            elif protocol == 'icmp' and icmp_type is not None and icmp_type != -1:
+                icmp_spec = str(icmp_type)
+                if icmp_code is not None and icmp_code != -1:
+                    icmp_spec += f"/{icmp_code}"
+                a += ['--icmp-type', icmp_spec]
+
+        iptf('-A', acl_chain, *a, '-j', action)
+
+# Default: DROP all unmatched traffic (implicit deny at end of ACL)
+iptf('-A', acl_chain, '-j', 'DROP')
+
+print(f"apply-network-acl: applied {len(rules)} ACL rule(s) to chain {acl_chain}")
+PYEOF
+
+    local py_exit=$?
+
+    if [ "${cleanup_acl_file}" = "true" ]; then
+        rm -f "${acl_rules_file}" 2>/dev/null || true
+    fi
+
+    if [ ${py_exit} -ne 0 ]; then
+        log "apply-network-acl: Python rule builder exited ${py_exit}; ACL chain may be incomplete"
+    fi
+
+    # ---- 5. Insert jump from fchain to acl chain at position 1 ----
+    # ACL rules take precedence over the catch-all ACCEPT rules in fchain.
+    if ip netns exec "${NAMESPACE}" iptables -t filter -n -L "${fchain}" >/dev/null 2>&1; then
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -I "${fchain}" 1 -j "${acl_chain_name}" 2>/dev/null || true
+        log "apply-network-acl: inserted ACL jump in ${fchain}"
+    fi
+
+    release_lock
+    log "apply-network-acl: done network=${NETWORK_ID}"
+}
+
+##############################################################################
 # Main dispatcher
 ##############################################################################
 
@@ -2999,9 +3402,13 @@ COMMAND="${1:-}"
 shift || true
 
 case "${COMMAND}" in
-    implement)                cmd_implement                "$@" ;;
-    shutdown)                 cmd_shutdown                 "$@" ;;
-    destroy)                  cmd_destroy                  "$@" ;;
+    implement-network)        cmd_implement_network        "$@" ;;
+    shutdown-network)         cmd_shutdown_network         "$@" ;;
+    destroy-network)          cmd_destroy_network          "$@" ;;
+    # VPC lifecycle
+    implement-vpc)            cmd_implement_vpc            "$@" ;;
+    shutdown-vpc)             cmd_shutdown_vpc             "$@" ;;
+    destroy-vpc)              cmd_destroy_vpc              "$@" ;;
     assign-ip)                cmd_assign_ip                "$@" ;;
     release-ip)               cmd_release_ip               "$@" ;;
     add-static-nat)           cmd_add_static_nat           "$@" ;;
@@ -3028,15 +3435,19 @@ case "${COMMAND}" in
     # Load balancing (haproxy)
     apply-fw-rules)           cmd_apply_fw_rules           "$@" ;;
     apply-lb-rules)           cmd_apply_lb_rules           "$@" ;;
+    # ACL rules (VPC network ACLs)
+    apply-network-acl)        cmd_apply_network_acl        "$@" ;;
     # Custom actions
     custom-action)            cmd_custom_action            "$@" ;;
     "")
-        echo "Usage: $0 {implement|shutdown|destroy|assign-ip|release-ip|" \
+        echo "Usage: $0 {implement-network|shutdown-network|destroy-network|" \
+             "implement-vpc|shutdown-vpc|destroy-vpc|" \
+             "assign-ip|release-ip|" \
              "add-static-nat|delete-static-nat|add-port-forward|delete-port-forward|" \
              "config-dhcp-subnet|remove-dhcp-subnet|add-dhcp-entry|remove-dhcp-entry|set-dhcp-options|" \
              "config-dns-subnet|remove-dns-subnet|add-dns-entry|remove-dns-entry|" \
              "save-userdata|save-password|save-sshkey|save-hypervisor-hostname|save-vm-data|restore-network|" \
-             "apply-fw-rules|apply-lb-rules|custom-action} [options]" >&2
+             "apply-fw-rules|apply-lb-rules|apply-network-acl|custom-action} [options]" >&2
         exit 1 ;;
     *)
         echo "Unknown command: ${COMMAND}" >&2
