@@ -1397,7 +1397,7 @@ dhcp-option=3,${GATEWAY}
 dhcp-hostsfile=${dhcp_hosts}
 addn-hosts=${hosts}
 dhcp-optsfile=${dhcp_opts}
-log-facility=/var/log/cloudstack/network-namespace-dnsmasq-${NETWORK_ID}.log
+log-facility=/var/log/cloudstack/extensions/${_WRAPPER_EXT_DIR}/dnsmasq-${NETWORK_ID}.log
 EOF
     # Add DHCP option 15 (domain-search) when provided by the caller
     if [ -n "${DOMAIN}" ]; then
@@ -1649,7 +1649,7 @@ ${unixd_line}
 ${authz_line}
 
 DocumentRoot ${www}
-ErrorLog /var/log/cloudstack/network-namespace-apache2-${NETWORK_ID}.log
+ErrorLog /var/log/cloudstack/extensions/${_WRAPPER_EXT_DIR}/apache2-${NETWORK_ID}.log
 
 <VirtualHost ${listen_ip}:80>
     ServerName metadata
@@ -1718,7 +1718,7 @@ _svc_start_or_reload_passwd_server() {
     local script_f; script_f=$(_passwd_server_script)
     local pid_f;    pid_f=$(_passwd_server_pid)
     local passwd_f; passwd_f=$(_passwd_file)
-    local log_f;    log_f="/var/log/cloudstack/network-namespace-passwd-${NETWORK_ID}.log"
+    local log_f;    log_f="/var/log/cloudstack/extensions/${_WRAPPER_EXT_DIR}/passwd-${NETWORK_ID}.log"
 
     mkdir -p "$(dirname "${script_f}")"
     touch "${passwd_f}"
@@ -2721,6 +2721,159 @@ PYEOF
 ##############################################################################
 # Command: custom-action
 
+_pbr_param() {
+    # Return the first non-empty key from ACTION_PARAMS_JSON.
+    local _k _v
+    for _k in "$@"; do
+        _v=$(_json_get "${ACTION_PARAMS_JSON}" "${_k}")
+        if [ -n "${_v}" ]; then
+            echo "${_v}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+_pbr_table_file() { echo "/etc/iproute2/rt_tables"; }
+
+_pbr_create_table() {
+    local tid tname tf tmp
+    tid="$(_pbr_param table-id table_id id tableid)"
+    tname="$(_pbr_param table-name table_name name tablename table)"
+    [ -z "${tid}" ] && die "pbr-create-table: missing table id"
+    [ -z "${tname}" ] && die "pbr-create-table: missing table name"
+
+    tf="$(_pbr_table_file)"
+    grep -Eq "^[[:space:]]*${tid}[[:space:]]+${tname}([[:space:]]|$)" "${tf}" 2>/dev/null && {
+        echo "pbr-create-table: exists ${tid} ${tname}"
+        return 0
+    }
+
+    tmp=$(mktemp /tmp/cs-extnet-rt-tables-XXXXXX)
+    awk -v tid="${tid}" -v tname="${tname}" '
+        BEGIN { done = 0 }
+        {
+            if ($0 ~ "^[[:space:]]*#" || $0 ~ "^[[:space:]]*$") { print; next }
+            if ($1 == tid || $2 == tname) {
+                if (!done) {
+                    print tid " " tname
+                    done = 1
+                }
+                next
+            }
+            print
+        }
+        END {
+            if (!done) print tid " " tname
+        }
+    ' "${tf}" > "${tmp}"
+    cat "${tmp}" > "${tf}"
+    rm -f "${tmp}" 2>/dev/null || true
+    echo "pbr-create-table: OK ${tid} ${tname}"
+}
+
+_pbr_delete_table() {
+    local tid tname tf tmp
+    tid="$(_pbr_param table-id table_id id tableid)"
+    tname="$(_pbr_param table-name table_name name tablename table)"
+    [ -z "${tid}" ] && [ -z "${tname}" ] && die "pbr-delete-table: missing table id/name"
+
+    tf="$(_pbr_table_file)"
+    tmp=$(mktemp /tmp/cs-extnet-rt-tables-XXXXXX)
+    awk -v tid="${tid}" -v tname="${tname}" '
+        {
+            if ($0 ~ "^[[:space:]]*#" || $0 ~ "^[[:space:]]*$") { print; next }
+            if ((tid != "" && $1 == tid) || (tname != "" && $2 == tname)) {
+                next
+            }
+            print
+        }
+    ' "${tf}" > "${tmp}"
+    cat "${tmp}" > "${tf}"
+    rm -f "${tmp}" 2>/dev/null || true
+    echo "pbr-delete-table: OK id=${tid:-n/a} name=${tname:-n/a}"
+}
+
+_pbr_list_tables() {
+    awk '
+        {
+            if ($0 ~ "^[[:space:]]*#" || $0 ~ "^[[:space:]]*$") next
+            print
+        }
+    ' "$(_pbr_table_file)"
+}
+
+_pbr_add_route() {
+    local table route
+    table="$(_pbr_param table table-name table_name tablename table-id table_id id tableid)"
+    route="$(_pbr_param route route-spec route_spec)"
+    [ -z "${table}" ] && die "pbr-add-route: missing table"
+    [ -z "${route}" ] && die "pbr-add-route: missing route spec"
+    [ -z "${NAMESPACE}" ] && die "pbr-add-route: namespace not resolved"
+
+    # replace is idempotent and avoids duplicate route errors.
+    ip netns exec "${NAMESPACE}" sh -c "ip route replace ${route} table ${table}"
+    echo "pbr-add-route: OK table=${table} route=${route}"
+}
+
+_pbr_delete_route() {
+    local table route
+    table="$(_pbr_param table table-name table_name tablename table-id table_id id tableid)"
+    route="$(_pbr_param route route-spec route_spec)"
+    [ -z "${table}" ] && die "pbr-delete-route: missing table"
+    [ -z "${route}" ] && die "pbr-delete-route: missing route spec"
+    [ -z "${NAMESPACE}" ] && die "pbr-delete-route: namespace not resolved"
+
+    ip netns exec "${NAMESPACE}" sh -c "ip route del ${route} table ${table}" 2>/dev/null || true
+    echo "pbr-delete-route: OK table=${table} route=${route}"
+}
+
+_pbr_list_routes() {
+    local table
+    table="$(_pbr_param table table-name table_name tablename table-id table_id id tableid)"
+    [ -z "${NAMESPACE}" ] && die "pbr-list-routes: namespace not resolved"
+    if [ -n "${table}" ]; then
+        ip netns exec "${NAMESPACE}" ip route show table "${table}"
+    else
+        ip netns exec "${NAMESPACE}" ip route show table all
+    fi
+}
+
+_pbr_add_rule() {
+    local table rule
+    table="$(_pbr_param table table-name table_name tablename table-id table_id id tableid)"
+    rule="$(_pbr_param rule rule-spec rule_spec)"
+    [ -z "${table}" ] && die "pbr-add-rule: missing table"
+    [ -z "${rule}" ] && die "pbr-add-rule: missing rule spec"
+    [ -z "${NAMESPACE}" ] && die "pbr-add-rule: namespace not resolved"
+
+    ip netns exec "${NAMESPACE}" sh -c "ip rule add ${rule} table ${table}" 2>/dev/null || true
+    echo "pbr-add-rule: OK table=${table} rule=${rule}"
+}
+
+_pbr_delete_rule() {
+    local table rule
+    table="$(_pbr_param table table-name table_name tablename table-id table_id id tableid)"
+    rule="$(_pbr_param rule rule-spec rule_spec)"
+    [ -z "${table}" ] && die "pbr-delete-rule: missing table"
+    [ -z "${rule}" ] && die "pbr-delete-rule: missing rule spec"
+    [ -z "${NAMESPACE}" ] && die "pbr-delete-rule: namespace not resolved"
+
+    ip netns exec "${NAMESPACE}" sh -c "ip rule del ${rule} table ${table}" 2>/dev/null || true
+    echo "pbr-delete-rule: OK table=${table} rule=${rule}"
+}
+
+_pbr_list_rules() {
+    local table
+    table="$(_pbr_param table table-name table_name tablename table-id table_id id tableid)"
+    [ -z "${NAMESPACE}" ] && die "pbr-list-rules: namespace not resolved"
+    if [ -n "${table}" ]; then
+        ip netns exec "${NAMESPACE}" ip rule show | grep -E "[[:space:]]lookup[[:space:]]+${table}([[:space:]]|$)" || true
+    else
+        ip netns exec "${NAMESPACE}" ip rule show
+    fi
+}
+
 cmd_custom_action() {
     NETWORK_ID=""
     VPC_ID=""
@@ -2753,6 +2906,7 @@ cmd_custom_action() {
     CHOSEN_ID="${VPC_ID:-${NETWORK_ID}}"
 
     _load_state
+    acquire_lock "${NETWORK_ID}"
 
     log "custom-action: network=${NETWORK_ID} ns=${NAMESPACE} action=${ACTION_NAME} params=${ACTION_PARAMS_JSON}"
 
@@ -2782,16 +2936,45 @@ cmd_custom_action() {
             echo "=== VPC/shared state ($(_vpc_state_dir)) ==="
             ls -la "$(_vpc_state_dir)/" 2>/dev/null || echo "(no vpc state)"
             ;;
+        pbr-create-table)
+            _pbr_create_table
+            ;;
+        pbr-delete-table)
+            _pbr_delete_table
+            ;;
+        pbr-list-tables)
+            _pbr_list_tables
+            ;;
+        pbr-add-route)
+            _pbr_add_route
+            ;;
+        pbr-delete-route)
+            _pbr_delete_route
+            ;;
+        pbr-list-routes)
+            _pbr_list_routes
+            ;;
+        pbr-add-rule)
+            _pbr_add_rule
+            ;;
+        pbr-delete-rule)
+            _pbr_delete_rule
+            ;;
+        pbr-list-rules)
+            _pbr_list_rules
+            ;;
         *)
             local hook="${STATE_DIR}/hooks/custom-action-${ACTION_NAME}.sh"
             if [ -x "${hook}" ]; then
                 exec "${hook}" --network-id "${NETWORK_ID}" --action "${ACTION_NAME}" \
                      --action-params "${ACTION_PARAMS_JSON}"
             else
-                die "Unknown action '${ACTION_NAME}'. Built-ins: reboot-device, dump-config"
+                die "Unknown action '${ACTION_NAME}'. Built-ins: reboot-device, dump-config, pbr-*"
             fi
             ;;
     esac
+
+    release_lock
 }
 
 ##############################################################################
