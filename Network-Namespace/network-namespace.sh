@@ -104,7 +104,7 @@ _EXT_DIR_NAME="$(basename "$(dirname "${_SELF}")")"
 DEFAULT_SCRIPT_PATH="/etc/cloudstack/extensions/${_EXT_DIR_NAME}/${_SCRIPT_BASENAME}-wrapper.sh"
 
 # Log file — under /var/log/cloudstack/extensions/ named after the extension.
-LOG_FILE="/var/log/cloudstack/extensions/${_EXT_DIR_NAME}.log"
+LOG_FILE="/tmp/cloudstack-extensions/${_EXT_DIR_NAME}.log"
 mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
 TMPDIR_BASE=/tmp
 
