@@ -2461,7 +2461,7 @@ FW_INGRESS_PREFIX = 'CS_EXTNET_FWI_'
 
 def _run(table, *args):
     cmd = ['ip', 'netns', 'exec', namespace, 'iptables', '-t', table] + list(args)
-    r = subprocess.run(cmd, capture_output=True)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         print(f"iptables ({table}): {r.stderr.decode().strip()}", file=sys.stderr)
     return r
@@ -3614,7 +3614,7 @@ except Exception as e:
 
 def _run(table, *args):
     cmd = ['ip', 'netns', 'exec', namespace, 'iptables', '-t', table] + list(args)
-    r = subprocess.run(cmd, capture_output=True)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         print(f"iptables ({table}): {r.stderr.decode().strip()}", file=sys.stderr)
     return r
