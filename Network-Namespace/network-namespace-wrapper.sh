@@ -2890,7 +2890,7 @@ cmd_custom_action() {
             *)               shift ;;
         esac
     done
-    [ -z "${NETWORK_ID}" ]  && die "custom-action: missing --network-id"
+    [ -z "${NETWORK_ID}" ] && [ -z "${VPC_ID}" ] && die "custom-action: missing --network-id or --vpc-id"
     [ -z "${ACTION_NAME}" ] && die "custom-action: missing --action"
 
     # Set NAMESPACE/CHOSEN_ID similar to parse_args
@@ -2905,8 +2905,15 @@ cmd_custom_action() {
     fi
     CHOSEN_ID="${VPC_ID:-${NETWORK_ID}}"
 
+    # Ensure the namespace exists when running VPC custom actions
+    if [ -n "${VPC_ID}" ] && ! ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        log "custom-action: creating namespace ${NAMESPACE} for VPC ${VPC_ID}"
+        ip netns add "${NAMESPACE}" 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" ip link set lo up 2>/dev/null || true
+    fi
+
     _load_state
-    acquire_lock "${NETWORK_ID}"
+    acquire_lock "${CHOSEN_ID}"
 
     log "custom-action: network=${NETWORK_ID} ns=${NAMESPACE} action=${ACTION_NAME} params=${ACTION_PARAMS_JSON}"
 
@@ -3384,6 +3391,129 @@ cmd_implement_vpc() {
 }
 
 ##############################################################################
+# Command: update-vpc-source-nat-ip
+# Updates VPC source NAT egress to a new public IP without restarting tiers.
+# Reconciles public veth/IP state, default route, VPC SNAT iptables chain,
+# and source NAT markers under ${STATE_DIR}/vpc-<vpcId>/ips/.
+##############################################################################
+
+cmd_update_vpc_source_nat_ip() {
+    parse_vpc_args "$@"
+    acquire_lock "vpc-${VPC_ID}"
+
+    [ -z "${PUBLIC_IP}" ]   && die "update-vpc-source-nat-ip: missing --public-ip"
+
+    local vsd="${STATE_DIR}/vpc-${VPC_ID}"
+    mkdir -p "${vsd}/ips"
+
+    # Load persisted values when omitted by the caller.
+    if [ -z "${VPC_CIDR}" ] && [ -f "${vsd}/cidr" ]; then
+        VPC_CIDR=$(cat "${vsd}/cidr" 2>/dev/null || true)
+    fi
+    if [ -z "${PUBLIC_VLAN}" ] && [ -f "${vsd}/ips/${PUBLIC_IP}.pvlan" ]; then
+        PUBLIC_VLAN=$(cat "${vsd}/ips/${PUBLIC_IP}.pvlan" 2>/dev/null || true)
+    fi
+
+    [ -z "${VPC_CIDR}" ]   && die "update-vpc-source-nat-ip: missing --cidr (or persisted vpc cidr)"
+    [ -z "${PUBLIC_VLAN}" ] && die "update-vpc-source-nat-ip: missing --public-vlan"
+
+    log "update-vpc-source-nat-ip: vpc=${VPC_ID} ns=${NAMESPACE} old=? new=${PUBLIC_IP} pvlan=${PUBLIC_VLAN} cidr=${VPC_CIDR}"
+
+    local old_source_nat_ip=""
+    local old_public_vlan=""
+    local f ip flag
+    for f in "${vsd}/ips/"*; do
+        [ -f "${f}" ] || continue
+        ip=$(basename "${f}")
+        case "${ip}" in
+            *.pvlan|*.tier) continue ;;
+        esac
+        flag=$(cat "${f}" 2>/dev/null || true)
+        if [ "${flag}" = "true" ]; then
+            old_source_nat_ip="${ip}"
+            break
+        fi
+    done
+
+    if [ -n "${old_source_nat_ip}" ] && [ -f "${vsd}/ips/${old_source_nat_ip}.pvlan" ]; then
+        old_public_vlan=$(cat "${vsd}/ips/${old_source_nat_ip}.pvlan" 2>/dev/null || true)
+    fi
+
+    local new_pveth_h new_pveth_n pub_br
+    new_pveth_h=$(pub_veth_host_name "${PUBLIC_VLAN}" "${VPC_ID}")
+    new_pveth_n=$(pub_veth_ns_name   "${PUBLIC_VLAN}" "${VPC_ID}")
+    ensure_host_bridge "${PUB_ETH}" "${PUBLIC_VLAN}"
+    pub_br=$(host_bridge_name "${PUB_ETH}" "${PUBLIC_VLAN}")
+
+    if ! ip link show "${new_pveth_h}" >/dev/null 2>&1; then
+        ip link add "${new_pveth_h}" type veth peer name "${new_pveth_n}"
+        ip link set "${new_pveth_n}" netns "${NAMESPACE}"
+        ip link set "${new_pveth_h}" master "${pub_br}"
+        ip link set "${new_pveth_h}" up
+        ip netns exec "${NAMESPACE}" ip link set "${new_pveth_n}" up
+        log "update-vpc-source-nat-ip: created public veth ${new_pveth_h} <-> ${new_pveth_n}"
+    else
+        ip link set "${new_pveth_h}" up 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" ip link set "${new_pveth_n}" up 2>/dev/null || true
+    fi
+
+    ensure_public_ip_on_namespace "${PUBLIC_IP}" "${PUBLIC_CIDR}" "${new_pveth_n}" "${new_pveth_h}"
+    ip route replace "${PUBLIC_IP}/32" dev "${new_pveth_h}" 2>/dev/null || true
+
+    if [ -n "${old_source_nat_ip}" ] && [ "${old_source_nat_ip}" != "${PUBLIC_IP}" ] && [ -n "${old_public_vlan}" ]; then
+        local old_pveth_n
+        old_pveth_n=$(pub_veth_ns_name "${old_public_vlan}" "${VPC_ID}")
+        if [ "${old_pveth_n}" != "${new_pveth_n}" ]; then
+            ip netns exec "${NAMESPACE}" ip route show default 2>/dev/null | \
+                grep " dev ${old_pveth_n}\b" | \
+                while read -r route; do
+                    ip netns exec "${NAMESPACE}" ip route del ${route} 2>/dev/null || true
+                done
+        fi
+    fi
+
+    if [ -n "${PUBLIC_GATEWAY}" ]; then
+        ip netns exec "${NAMESPACE}" ip route replace default \
+            via "${PUBLIC_GATEWAY}" dev "${new_pveth_n}" 2>/dev/null || \
+        ip netns exec "${NAMESPACE}" ip route add default \
+            via "${PUBLIC_GATEWAY}" dev "${new_pveth_n}" 2>/dev/null || true
+        log "update-vpc-source-nat-ip: default route via ${PUBLIC_GATEWAY} dev ${new_pveth_n}"
+    fi
+
+    local vpc_post_chain="${CHAIN_PREFIX}_${VPC_ID}_VPC_POST"
+    ensure_chain nat "${vpc_post_chain}"
+    ensure_jump  nat POSTROUTING "${vpc_post_chain}"
+
+    # This chain is dedicated to VPC source NAT egress; rebuild to a single rule.
+    ip netns exec "${NAMESPACE}" iptables -t nat -F "${vpc_post_chain}"
+    ip netns exec "${NAMESPACE}" iptables -t nat \
+        -A "${vpc_post_chain}" -s "${VPC_CIDR}" -o "${new_pveth_n}" -j SNAT --to-source "${PUBLIC_IP}"
+
+    # Keep exactly one source-NAT marker: new public IP=true, all others=false.
+    for f in "${vsd}/ips/"*; do
+        [ -f "${f}" ] || continue
+        ip=$(basename "${f}")
+        case "${ip}" in
+            *.pvlan|*.tier) continue ;;
+        esac
+        echo "false" > "${f}"
+    done
+    echo "true" > "${vsd}/ips/${PUBLIC_IP}"
+    echo "${PUBLIC_VLAN}" > "${vsd}/ips/${PUBLIC_IP}.pvlan"
+
+    local _arping_bin
+    _arping_bin=$(_find_arping) || true
+    if [ -n "${_arping_bin}" ]; then
+        ip netns exec "${NAMESPACE}" "${_arping_bin}" -c 3 -U -I "${new_pveth_n}" "${PUBLIC_IP}" \
+            >/dev/null 2>&1 || true
+    fi
+
+    _dump_iptables "${NAMESPACE}"
+    release_lock
+    log "update-vpc-source-nat-ip: done vpc=${VPC_ID} old=${old_source_nat_ip:-none} new=${PUBLIC_IP}"
+}
+
+##############################################################################
 # Command: shutdown-vpc
 # Removes the VPC namespace after all tiers have been shut down.
 # Called by shutdownVpc() in NetworkExtensionElement after all tiers are gone.
@@ -3590,6 +3720,7 @@ case "${COMMAND}" in
     destroy-network)          cmd_destroy_network          "$@" ;;
     # VPC lifecycle
     implement-vpc)            cmd_implement_vpc            "$@" ;;
+    update-vpc-source-nat-ip) cmd_update_vpc_source_nat_ip "$@" ;;
     shutdown-vpc)             cmd_shutdown_vpc             "$@" ;;
     destroy-vpc)              cmd_destroy_vpc              "$@" ;;
     assign-ip)                cmd_assign_ip                "$@" ;;
@@ -3624,7 +3755,7 @@ case "${COMMAND}" in
     custom-action)            cmd_custom_action            "$@" ;;
     "")
         echo "Usage: $0 {implement-network|shutdown-network|destroy-network|" \
-             "implement-vpc|shutdown-vpc|destroy-vpc|" \
+             "implement-vpc|update-vpc-source-nat-ip|shutdown-vpc|destroy-vpc|" \
              "assign-ip|release-ip|" \
              "add-static-nat|delete-static-nat|add-port-forward|delete-port-forward|" \
              "config-dhcp-subnet|remove-dhcp-subnet|add-dhcp-entry|remove-dhcp-entry|set-dhcp-options|" \
