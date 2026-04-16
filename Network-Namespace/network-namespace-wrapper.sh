@@ -616,6 +616,8 @@ cmd_implement_network() {
         log "Created namespace ${NAMESPACE}"
     fi
     ip netns exec "${NAMESPACE}" ip link set lo up 2>/dev/null || true
+    # Ensure per-namespace iproute2 rt_tables for PBR isolation
+    _pbr_ensure_table_file
 
     # Disable IPv6 inside the namespace to avoid IPv6 autoconf/link-local behavior
     # Apply globally and to the default and loopback interfaces. Idempotent.
@@ -802,6 +804,7 @@ cmd_shutdown_network() {
     # across tiers and must only be deleted when the last tier is destroyed.
     if [ -z "${VPC_ID}" ]; then
         ip netns del "${NAMESPACE}" 2>/dev/null || true
+        rm -rf "/etc/netns/${NAMESPACE}" 2>/dev/null || true
         log "shutdown-network: deleted namespace ${NAMESPACE}"
     else
         log "shutdown-network: preserved shared namespace ${NAMESPACE} (VPC tier)"
@@ -872,6 +875,7 @@ cmd_destroy_network() {
         # Isolated network: delete the namespace directly
         if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
             ip netns del "${NAMESPACE}"
+            rm -rf "/etc/netns/${NAMESPACE}" 2>/dev/null || true
             log "destroy-network: deleted namespace ${NAMESPACE}"
         fi
     fi
@@ -2734,7 +2738,28 @@ _pbr_param() {
     echo ""
 }
 
-_pbr_table_file() { echo "/etc/iproute2/rt_tables"; }
+_pbr_table_file() {
+    [ -z "${NAMESPACE}" ] && die "pbr: namespace not resolved"
+    echo "/etc/netns/${NAMESPACE}/iproute2/rt_tables"
+}
+
+# Ensure the per-namespace rt_tables file exists; seed from the system default.
+# Works with ip netns exec which auto-bind-mounts /etc/netns/<NS>/* over /etc/*.
+_pbr_ensure_table_file() {
+    local tf
+    tf="$(_pbr_table_file)"
+    if [ ! -f "${tf}" ]; then
+        mkdir -p "$(dirname "${tf}")"
+        echo "255	local" > "${tf}"
+        echo "254	main" >> "${tf}"
+        echo "253	default" >> "${tf}"
+        echo "0	unspec" >> "${tf}"
+        log "pbr: created per-namespace table file ${tf}"
+    fi
+    if [ ! -d "/etc/iproute2" ]; then
+      mkdir -p /etc/iproute2/
+    fi
+}
 
 _pbr_create_table() {
     local tid tname tf tmp
@@ -2743,6 +2768,7 @@ _pbr_create_table() {
     [ -z "${tid}" ] && die "pbr-create-table: missing table id"
     [ -z "${tname}" ] && die "pbr-create-table: missing table name"
 
+    _pbr_ensure_table_file
     tf="$(_pbr_table_file)"
     grep -Eq "^[[:space:]]*${tid}[[:space:]]+${tname}([[:space:]]|$)" "${tf}" 2>/dev/null && {
         echo "pbr-create-table: exists ${tid} ${tname}"
@@ -2778,6 +2804,7 @@ _pbr_delete_table() {
     tname="$(_pbr_param table-name table_name name tablename table)"
     [ -z "${tid}" ] && [ -z "${tname}" ] && die "pbr-delete-table: missing table id/name"
 
+    _pbr_ensure_table_file
     tf="$(_pbr_table_file)"
     tmp=$(mktemp /tmp/cs-extnet-rt-tables-XXXXXX)
     awk -v tid="${tid}" -v tname="${tname}" '
@@ -2795,6 +2822,7 @@ _pbr_delete_table() {
 }
 
 _pbr_list_tables() {
+    _pbr_ensure_table_file
     awk '
         {
             if ($0 ~ "^[[:space:]]*#" || $0 ~ "^[[:space:]]*$") next
@@ -2910,6 +2938,7 @@ cmd_custom_action() {
         log "custom-action: creating namespace ${NAMESPACE} for VPC ${VPC_ID}"
         ip netns add "${NAMESPACE}" 2>/dev/null || true
         ip netns exec "${NAMESPACE}" ip link set lo up 2>/dev/null || true
+        _pbr_ensure_table_file
     fi
 
     _load_state
@@ -3306,6 +3335,8 @@ cmd_implement_vpc() {
         log "implement-vpc: created namespace ${NAMESPACE}"
     fi
     ip netns exec "${NAMESPACE}" ip link set lo up 2>/dev/null || true
+    # Ensure per-namespace iproute2 rt_tables for PBR isolation
+    _pbr_ensure_table_file
 
     # Disable IPv6 inside the namespace
     ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
@@ -3525,6 +3556,7 @@ cmd_shutdown_vpc() {
 
     if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
         ip netns del "${NAMESPACE}"
+        rm -rf "/etc/netns/${NAMESPACE}" 2>/dev/null || true
         log "shutdown-vpc: deleted namespace ${NAMESPACE}"
     else
         log "shutdown-vpc: namespace ${NAMESPACE} not found (already removed?)"
@@ -3544,6 +3576,7 @@ cmd_destroy_vpc() {
 
     if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
         ip netns del "${NAMESPACE}"
+        rm -rf "/etc/netns/${NAMESPACE}" 2>/dev/null || true
         log "destroy-vpc: deleted namespace ${NAMESPACE}"
     fi
 
