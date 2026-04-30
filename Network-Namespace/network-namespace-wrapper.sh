@@ -2902,6 +2902,47 @@ _pbr_list_rules() {
     fi
 }
 
+_pbr_emit_custom_action_result() {
+    local action="$1"
+    shift
+    local raw_output
+    raw_output="$("$@")"
+
+    RAW_OUTPUT="${raw_output}" python3 - "${action}" << 'PYEOF'
+import json
+import os
+import sys
+
+action = sys.argv[1]
+raw = os.environ.get("RAW_OUTPUT", "")
+rows = [line.rstrip() for line in raw.splitlines() if line.strip()]
+
+if action == "pbr-list-tables":
+    message = []
+    for row in rows:
+        parts = row.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            message.append({"id": parts[0], "name": parts[1]})
+        else:
+            # Preserve raw rows that do not match the standard "<id> <name>" format.
+            message.append({"result": row})
+elif action == "pbr-list-routes":
+    message = [{"route": row} for row in rows]
+elif action == "pbr-list-rules":
+    message = [{"rule": row} for row in rows]
+elif rows:
+    message = [{"action": action, "result": row} for row in rows]
+else:
+    message = [{"action": action, "result": "OK"}]
+
+print(json.dumps({
+    "status": "success",
+    "printmessage": "true",
+    "message": message
+}))
+PYEOF
+}
+
 cmd_custom_action() {
     NETWORK_ID=""
     VPC_ID=""
@@ -2973,31 +3014,31 @@ cmd_custom_action() {
             ls -la "$(_vpc_state_dir)/" 2>/dev/null || echo "(no vpc state)"
             ;;
         pbr-create-table)
-            _pbr_create_table
+            _pbr_emit_custom_action_result "pbr-create-table" _pbr_create_table
             ;;
         pbr-delete-table)
-            _pbr_delete_table
+            _pbr_emit_custom_action_result "pbr-delete-table" _pbr_delete_table
             ;;
         pbr-list-tables)
-            _pbr_list_tables
+            _pbr_emit_custom_action_result "pbr-list-tables" _pbr_list_tables
             ;;
         pbr-add-route)
-            _pbr_add_route
+            _pbr_emit_custom_action_result "pbr-add-route" _pbr_add_route
             ;;
         pbr-delete-route)
-            _pbr_delete_route
+            _pbr_emit_custom_action_result "pbr-delete-route" _pbr_delete_route
             ;;
         pbr-list-routes)
-            _pbr_list_routes
+            _pbr_emit_custom_action_result "pbr-list-routes" _pbr_list_routes
             ;;
         pbr-add-rule)
-            _pbr_add_rule
+            _pbr_emit_custom_action_result "pbr-add-rule" _pbr_add_rule
             ;;
         pbr-delete-rule)
-            _pbr_delete_rule
+            _pbr_emit_custom_action_result "pbr-delete-rule" _pbr_delete_rule
             ;;
         pbr-list-rules)
-            _pbr_list_rules
+            _pbr_emit_custom_action_result "pbr-list-rules" _pbr_list_rules
             ;;
         *)
             local hook="${STATE_DIR}/hooks/custom-action-${ACTION_NAME}.sh"
