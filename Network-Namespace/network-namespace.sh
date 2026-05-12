@@ -22,44 +22,25 @@
 # Proxy script for the network-namespace CloudStack extension.
 # Runs on the CloudStack management server.
 #
-# Two modes of operation:
+# Invocation model:
+#   network-namespace.sh <command> <payload-file> <timeout-seconds>
 #
-#  1. ensure-network-device  (local, no SSH)
-#     Called by NetworkExtensionElement before every network operation.
-#     Selects or re-validates the network device for the given network ID.
-#     Reads the candidate host list from --physical-network-extension-details["hosts"]
-#     (comma-separated).
-#     If the previously selected host (from --current-details JSON) is still
-#     reachable it is kept; otherwise a new host is chosen from the list.
-#     Prints a single-line JSON object to stdout, e.g.:
+# The payload JSON includes top-level extension details:
+#   physical-network-extension-details
+#   network-extension-details
+#
+# For standard commands, command-specific keys are nested under payload.{...}.
+# For custom-action, command-specific keys are top-level (flat payload).
+#
+# Two runtime modes:
+#  1) ensure-network-device (local, no SSH): selects/revalidates host and emits
+#     a single-line JSON object like:
 #       {"host":"192.168.1.10","namespace":"cs-net-42"}
-#     The caller (NetworkExtensionElement) stores this in network_details and
-#     forwards it to all future calls as --network-extension-details.
+#  2) all other commands: forwards the payload file to the selected host and
+#     executes network-namespace-wrapper.sh remotely.
 #
-#  2. All other commands  (forwarded to the target host via SSH)
-#     The target host is taken from --network-extension-details["host"].
-#     The remote script (network-namespace-wrapper.sh) is called with all
-#     arguments including both --physical-network-extension-details and
-#     --network-extension-details.
-#
-# ---- CLI arguments injected by NetworkExtensionElement ----
-#
-#   --physical-network-extension-details <json>
-#       JSON object with all extension_resource_map_details registered for this
-#       extension on the physical network.  No pre-defined keys — the user and
-#       the script agree on the schema.  Typical keys for a KVM-namespace backend:
-#         hosts     – comma-separated list of host IPs for HA/selection
-#         port      – SSH port (default 22)
-#         username  – SSH user (default root)
-#         password  – SSH password  (sensitive, not logged)
-#         sshkey    – PEM-encoded SSH private key  (sensitive, not logged)
-#
-#   --network-extension-details <json>
-#       Per-network opaque JSON blob (from network_details key ext.details).
-#       '{}' on the first ensure-network-device call.
-#       This script is the sole owner — CloudStack stores and forwards it verbatim.
-#         host      – previously selected host IP
-#         namespace – Linux network namespace name (cs-net-<networkId>)
+# Common extension-detail keys (inside physical-network-extension-details):
+#   hosts, host, port, username, password, sshkey
 #
 # ---- SSH authentication priority ----
 #   1. sshkey  field in --physical-network-extension-details → PEM key
@@ -137,11 +118,46 @@ json_get() {
 # ---------------------------------------------------------------------------
 
 if [ $# -lt 1 ]; then
-    die "Usage: network-namespace.sh <command> [arguments...]" 1
+    die "Usage: network-namespace.sh <command> <payload-file> <timeout-seconds>" 1
 fi
 
 COMMAND="$1"
-shift
+shift || true
+
+PAYLOAD_FILE=""
+TIMEOUT_SECONDS=""
+PAYLOAD_MODE="false"
+
+if [ $# -ge 1 ] && [ -f "${1}" ]; then
+    PAYLOAD_FILE="$1"
+    TIMEOUT_SECONDS="${2:-60}"
+    PAYLOAD_MODE="true"
+    shift || true
+    [ $# -gt 0 ] && shift || true
+fi
+
+payload_json_get() {
+    # payload_json_get <file> <path>  where path is dot-separated JSON path
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as fh:
+    data = json.load(fh)
+cur = data
+for part in sys.argv[2].split('.'):
+    if isinstance(cur, dict):
+        cur = cur.get(part)
+    else:
+        cur = None
+    if cur is None:
+        break
+if cur is None:
+    print("")
+elif isinstance(cur, (dict, list)):
+    print(json.dumps(cur, separators=(",", ":")))
+else:
+    print(str(cur))
+PY
+}
 
 # ---------------------------------------------------------------------------
 # Parse CLI arguments: extract known flags, collect the rest as FORWARD_ARGS
@@ -152,48 +168,47 @@ EXTENSION_DETAILS="{}"
 NETWORK_ID=""
 CURRENT_DETAILS="{}"
 VPC_ID=""
-VM_DATA_FILE=""
-FW_RULES_FILE=""
-RESTORE_DATA_FILE=""
-ACL_RULES_FILE=""
 FORWARD_ARGS=()
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --physical-network-extension-details)
-            PHYS_DETAILS="${2:-{}}"
-            shift 2 ;;
-        --network-extension-details)
-            EXTENSION_DETAILS="${2:-{}}"
-            shift 2 ;;
-        --network-id)
-            NETWORK_ID="${2:-}"
-            FORWARD_ARGS+=("$1" "$2")
-            shift 2 ;;
-        --vpc-id)
-            VPC_ID="${2:-}"
-            FORWARD_ARGS+=("$1" "$2")
-            shift 2 ;;
-        --current-details)
-            CURRENT_DETAILS="${2:-{}}"
-            shift 2 ;;
-        --vm-data-file)
-            VM_DATA_FILE="${2:-}"
-            shift 2 ;;
-        --fw-rules-file)
-            FW_RULES_FILE="${2:-}"
-            shift 2 ;;
-        --acl-rules-file)
-            ACL_RULES_FILE="${2:-}"
-            shift 2 ;;
-        --restore-data-file)
-            RESTORE_DATA_FILE="${2:-}"
-            shift 2 ;;
-        *)
-            FORWARD_ARGS+=("$1")
-            shift ;;
-    esac
-done
+if [ "${PAYLOAD_MODE}" = "true" ]; then
+    PHYS_DETAILS=$(payload_json_get "${PAYLOAD_FILE}" "physical-network-extension-details")
+    EXTENSION_DETAILS=$(payload_json_get "${PAYLOAD_FILE}" "network-extension-details")
+
+    if [ "${COMMAND}" = "custom-action" ]; then
+        NETWORK_ID=$(payload_json_get "${PAYLOAD_FILE}" "network_id")
+        VPC_ID=$(payload_json_get "${PAYLOAD_FILE}" "vpc_id")
+    else
+        NETWORK_ID=$(payload_json_get "${PAYLOAD_FILE}" "payload.network_id")
+        VPC_ID=$(payload_json_get "${PAYLOAD_FILE}" "payload.vpc_id")
+        CURRENT_DETAILS=$(payload_json_get "${PAYLOAD_FILE}" "payload.current_details")
+        [ -z "${CURRENT_DETAILS}" ] && CURRENT_DETAILS="{}"
+    fi
+else
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --physical-network-extension-details)
+                PHYS_DETAILS="${2:-{}}"
+                shift 2 ;;
+            --network-extension-details)
+                EXTENSION_DETAILS="${2:-{}}"
+                shift 2 ;;
+            --network-id)
+                NETWORK_ID="${2:-}"
+                FORWARD_ARGS+=("$1" "$2")
+                shift 2 ;;
+            --vpc-id)
+                VPC_ID="${2:-}"
+                FORWARD_ARGS+=("$1" "$2")
+                shift 2 ;;
+            --current-details)
+                CURRENT_DETAILS="${2:-{}}"
+                shift 2 ;;
+            *)
+                FORWARD_ARGS+=("$1")
+                shift ;;
+        esac
+    done
+fi
 
 REMOTE_SCRIPT="${CS_NET_SCRIPT_PATH:-${DEFAULT_SCRIPT_PATH}}"
 
@@ -412,37 +427,22 @@ if [ -z "${REMOTE_HOST}" ]; then
 fi
 [ -z "${REMOTE_HOST}" ] && die "No target host available. Run ensure-network-device first." 1
 
-# Build the remote command — quote each argument and forward both JSON blobs
-remote_args=()
-for arg in "${FORWARD_ARGS[@]}"; do
-    remote_args+=("'${arg//"'"/"'\\''"}'" )
-done
-
+# Build and execute remote command
 REMOTE_PAYLOAD_FILES=()
-if [ -n "${VM_DATA_FILE}" ]; then
-    REMOTE_VM_DATA_FILE=$(upload_file_to_remote "${REMOTE_HOST}" "${VM_DATA_FILE}" "vm-data")
-    REMOTE_PAYLOAD_FILES+=("${REMOTE_VM_DATA_FILE}")
-    remote_args+=("'--vm-data-file'" "'${REMOTE_VM_DATA_FILE//"'"/"'\\''"}'")
-fi
-if [ -n "${FW_RULES_FILE}" ]; then
-    REMOTE_FW_RULES_FILE=$(upload_file_to_remote "${REMOTE_HOST}" "${FW_RULES_FILE}" "fw-rules")
-    REMOTE_PAYLOAD_FILES+=("${REMOTE_FW_RULES_FILE}")
-    remote_args+=("'--fw-rules-file'" "'${REMOTE_FW_RULES_FILE//"'"/"'\\''"}'")
-fi
-if [ -n "${ACL_RULES_FILE}" ]; then
-    REMOTE_ACL_RULES_FILE=$(upload_file_to_remote "${REMOTE_HOST}" "${ACL_RULES_FILE}" "acl-rules")
-    REMOTE_PAYLOAD_FILES+=("${REMOTE_ACL_RULES_FILE}")
-    remote_args+=("'--acl-rules-file'" "'${REMOTE_ACL_RULES_FILE//"'"/"'\\''"}'")
-fi
-if [ -n "${RESTORE_DATA_FILE}" ]; then
-    REMOTE_RESTORE_DATA_FILE=$(upload_file_to_remote "${REMOTE_HOST}" "${RESTORE_DATA_FILE}" "restore-data")
-    REMOTE_PAYLOAD_FILES+=("${REMOTE_RESTORE_DATA_FILE}")
-    remote_args+=("'--restore-data-file'" "'${REMOTE_RESTORE_DATA_FILE//"'"/"'\\''"}'")
-fi
+if [ "${PAYLOAD_MODE}" = "true" ]; then
+    REMOTE_PAYLOAD_FILE=$(upload_file_to_remote "${REMOTE_HOST}" "${PAYLOAD_FILE}" "payload")
+    REMOTE_PAYLOAD_FILES+=("${REMOTE_PAYLOAD_FILE}")
+    REMOTE_CMD="'${REMOTE_SCRIPT}' '${COMMAND}' '${REMOTE_PAYLOAD_FILE//"'"/"'\\''"}' '${TIMEOUT_SECONDS}'"
+else
+    remote_args=()
+    for arg in "${FORWARD_ARGS[@]}"; do
+        remote_args+=("'${arg//"'"/"'\\''"}'" )
+    done
 
-PHYS_ESCAPED="${PHYS_DETAILS//\'/\'\\\'\'}"
-EXT_ESCAPED="${EXTENSION_DETAILS//\'/\'\\\'\'}"
-REMOTE_CMD="'${REMOTE_SCRIPT}' '${COMMAND}' ${remote_args[*]} --physical-network-extension-details '${PHYS_ESCAPED}' --network-extension-details '${EXT_ESCAPED}'"
+    PHYS_ESCAPED="${PHYS_DETAILS//\'/\'\\\'\'}"
+    EXT_ESCAPED="${EXTENSION_DETAILS//\'/\'\\\'\'}"
+    REMOTE_CMD="'${REMOTE_SCRIPT}' '${COMMAND}' ${remote_args[*]} --physical-network-extension-details '${PHYS_ESCAPED}' --network-extension-details '${EXT_ESCAPED}'"
+fi
 
 log "Remote: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT} cmd=${COMMAND}"
 

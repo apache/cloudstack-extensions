@@ -52,7 +52,7 @@ required**.
    - [9. Unregister and delete the extension](#9-unregister-and-delete-the-extension)
 6. [Multiple extensions on the same physical network](#multiple-extensions-on-the-same-physical-network)
 7. [Wrapper script operations reference](#wrapper-script-operations-reference)
-8. [CLI argument reference](#cli-argument-reference)
+8. [Payload reference](#payload-reference)
 9. [Custom actions](#custom-actions)
 10. [Developer / testing notes](#developer--testing-notes)
 
@@ -173,19 +173,16 @@ physical network.  Both default to `eth1` when not explicitly set.
    reads all device details stored in `extension_resource_map_details`.
 3. `NetworkExtensionElement` builds a command line:
    ```
-   <extension_path>/network-namespace.sh <command> --network-id <id> [--vlan V] [--gateway G] ...
-       --physical-network-extension-details '<json>'
-       --network-extension-details '<json>'
+   <extension_path>/network-namespace.sh <command> <payload-file> <timeout-seconds>
    ```
-   Both JSON blobs are always appended as named CLI arguments:
-   * `--physical-network-extension-details` — JSON object with all physical-network
-     registration details (hosts, port, username, sshkey, …)
-   * `--network-extension-details` — per-network JSON blob (selected host, namespace, …)
-4. **`network-namespace.sh`** parses those CLI arguments, writes the SSH
+   The payload file includes top-level `physical-network-extension-details`,
+   top-level `network-extension-details`, and command-specific fields under
+   `payload` (except `custom-action`, which is a flat top-level payload).
+4. **`network-namespace.sh`** parses the payload JSON, writes the SSH
    private key to a temporary file (if `sshkey` is set in the physical-network
-   details), then SSHes to the remote host and runs the wrapper script with both
-   JSON blobs forwarded as CLI arguments.
-5. **`network-namespace-wrapper.sh`** parses the CLI arguments and executes the
+   details), uploads the payload file to the selected host, then runs the wrapper
+   script remotely as `<command> <payload-file> <timeout-seconds>`.
+5. **`network-namespace-wrapper.sh`** parses the payload and executes the
    requested operation using `ip link`, `iptables`, `ip addr`, etc. inside the
    network namespace.
 6. Exit codes from `network-namespace.sh`:
@@ -198,7 +195,7 @@ physical network.  Both default to `eth1` when not explicitly set.
 
 ### Authentication priority (network-namespace.sh)
 
-1. `sshkey` field in `--physical-network-extension-details` — PEM key written
+1. `sshkey` field in `physical-network-extension-details` — PEM key written
    to a temp file under `/tmp/.cs-extnet-key-XXXXXX/`, used with `ssh -i`.
    **Preferred** — the temp file is deleted on exit.
 2. `password` field — passed to `sshpass(1)` if available; `sshpass` must be
@@ -212,19 +209,19 @@ on `network-namespace.sh` (locally, **no SSH**).  This selects the KVM host for 
 network:
 
 1. **Sticky re-validation**: if a host was previously selected (from
-   `--current-details["host"]` or `--network-extension-details["host"]`) *and* that
+   `payload.current_details.host` or `network-extension-details.host`) *and* that
    host is still in the candidate list *and* still reachable, it is kept.
 2. **Hash-based selection**: for new or failed-over networks a stable preferred index
    is computed as `CRC32(<routing-key>) mod len(hosts)` where the routing key is
-   `vpc-id` for VPC networks (ensuring all tiers land on the same host) or
-   `network-id` for isolated networks.  Hosts are probed in order starting at that
+   `vpc_id` for VPC networks (ensuring all tiers land on the same host) or
+   `network_id` for isolated networks. Hosts are probed in order starting at that
    index until one answers.
 3. The result is printed as a single-line JSON object:
    ```json
    {"host":"192.168.1.10","namespace":"cs-net-42"}
    ```
-   CloudStack stores this as `network_extension_details` and forwards it to all
-   subsequent calls as `--network-extension-details`.
+   CloudStack stores this in `network_details.extension.details` and forwards it
+   to later calls through top-level `network-extension-details`.
 
 You can override the remote wrapper path for testing:
 ```bash
@@ -724,6 +721,8 @@ CloudStack resolves which extension to call by:
 
 ## Wrapper script operations reference
 
+CloudStack now invokes the wrapper through payload files.
+
 The `network-namespace-wrapper.sh` script runs on the remote KVM device.
 It receives the command as its first positional argument followed by named
 `--option value` pairs.
@@ -751,7 +750,7 @@ network-namespace-wrapper.sh implement-network \
 
 Actions:
 1. Create namespace `cs-vpc-<vpc-id>` (VPC) or `cs-net-<network-id>` (isolated).
-2. Resolve `GUEST_ETH` from `guest.network.device` in `--physical-network-extension-details`
+2. Resolve `GUEST_ETH` from `guest.network.device` in `physical-network-extension-details`
    (defaults to `eth1` when absent).
 3. Create VLAN sub-interface `GUEST_ETH.<vlan>` on the host.
 4. Create host bridge `br<GUEST_ETH>-<vlan>` and attach `GUEST_ETH.<vlan>` to it.
@@ -917,7 +916,7 @@ network-namespace-wrapper.sh assign-ip \
 ```
 
 Actions:
-1. Resolve `PUB_ETH` from `public.network.device` in `--physical-network-extension-details`
+1. Resolve `PUB_ETH` from `public.network.device` in `physical-network-extension-details`
    (defaults to `eth1` when absent).
 2. Create VLAN sub-interface `PUB_ETH.<pvlan>` and bridge `br<PUB_ETH>-<pvlan>` on the host.
 3. Create veth pair `vph-<pvlan>-<id>` (host) / `vpn-<pvlan>-<id>` (namespace).
@@ -1259,9 +1258,8 @@ in the Java layer).  Writes files under
 reloads both the **apache2 metadata HTTP service** (port 80) and the
 **VR-compatible password server** (port 8080) inside the namespace.
 
-> `network-namespace.sh` (the management-server proxy) automatically uploads
-> large payloads via SCP to a temporary file on the KVM host and passes
-> `--vm-data-file` to the wrapper instead of inlining the base64 blob.
+> `network-namespace.sh` uploads the single command payload file to the KVM host;
+> nested fields like `vm_data` stay inside that payload JSON.
 
 ### `save-userdata` / `save-password` / `save-sshkey` / `save-hypervisor-hostname`
 
@@ -1313,9 +1311,25 @@ network-namespace-wrapper.sh restore-network \
 
 ```
 network-namespace-wrapper.sh custom-action \
-    --network-id <id> \
-    --action <action-name>
+    <payload-file> \
+    <timeout-seconds>
 ```
+
+CloudStack now writes the custom-action request to a temporary JSON payload file
+and passes that file to the wrapper script. The payload contains the network or
+VPC identifiers, the action name, the caller-supplied action parameters, and
+the extension detail blobs that used to be forwarded as individual CLI flags.
+
+Expected payload keys:
+
+| JSON key | Description |
+|----------|-------------|
+| `network_id` | Network ID for network-level actions |
+| `vpc_id` | VPC ID for VPC-level actions |
+| `action` | Custom action name |
+| `action-params` | Caller-supplied JSON object for the action |
+| `physical_network_extension_details` | Physical-network extension details JSON |
+| `network_extension_details` | Per-network / per-VPC extension details JSON |
 
 Built-in actions:
 
@@ -1333,7 +1347,7 @@ Built-in actions:
 | `pbr-delete-rule` | Delete an `ip rule` policy rule mapped to a specific routing table inside the namespace |
 | `pbr-list-rules` | List policy rules (or only rules for one table) inside the namespace |
 
-PBR action parameter keys (`--action-params` JSON):
+PBR action parameter keys (`action-params` JSON in the payload file):
 
 | Action | Required keys | Optional keys |
 |--------|---------------|---------------|
@@ -1363,16 +1377,28 @@ fails with a descriptive error.
 
 ---
 
-## CLI argument reference
+## Payload reference
 
-### JSON blobs always forwarded by `network-namespace.sh`
+### Standard payload envelope
 
-| CLI Argument | Description |
+```json
+{
+  "physical-network-extension-details": {},
+  "network-extension-details": {},
+  "payload": {}
+}
+```
+
+For `custom-action`, `payload` is not nested; command fields are top-level.
+
+### Top-level extension details
+
+| Top-level key | Description |
 |--------------|-------------|
-| `--physical-network-extension-details <json>` | All `extension_resource_map_details` **plus** physical network metadata automatically added by `NetworkExtensionElement` (see table below). |
-| `--network-extension-details <json>` | Per-network opaque JSON blob (selected host, namespace). |
+| `physical-network-extension-details` | All `extension_resource_map_details` **plus** physical network metadata automatically added by `NetworkExtensionElement` (see table below). |
+| `network-extension-details` | Per-network opaque JSON blob (selected host, namespace). |
 
-### Connection details (keys in `--physical-network-extension-details`)
+### Connection details (keys in `physical-network-extension-details`)
 
 These keys are explicitly set when calling `registerExtension`:
 
@@ -1398,40 +1424,41 @@ The wrapper script uses `guest.network.device` (and `public.network.device`) to
 name bridges as `br<eth>-<vlan>` and veth pairs as `vh-<vlan>-<id>` /
 `vn-<vlan>-<id>` (guest) and `vph-<pvlan>-<id>` / `vpn-<pvlan>-<id>` (public).
 
-### Per-network details (keys in `--network-extension-details`)
+### Per-network details (keys in `network-extension-details`)
 
 | JSON key | Description |
 |----------|-------------|
 | `host` | Previously selected host IP (set by `ensure-network-device`) |
 | `namespace` | Linux network namespace name (e.g. `cs-net-<networkId>` or `cs-vpc-<vpcId>`) |
 
-### Additional per-command arguments
+### Common keys inside `payload` (standard commands)
 
-| CLI Argument | Commands | Description |
+| `payload` key | Commands | Description |
 |--------------|----------|-------------|
-| `--vpc-id <id>` | all | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
-| `--public-vlan <pvlan>` | `assign-ip`, `release-ip` | Public IP's VLAN tag (e.g. `101`) |
-| `--network-id <id>` | most | Network ID — CHOSEN_ID for veth names is `<vpc-id>` when VPC, else `<network-id>` |
-| `--extension-ip <ip>` | `implement-network`, `config-dhcp-subnet`, `config-dns-subnet`, `restore-network` | Dedicated IP for DHCP/DNS/metadata service (used instead of gateway when the namespace does not own the default route) |
-| `--current-details <json>` | `ensure-network-device` (proxy only) | Previous `--network-extension-details` JSON; used by `network-namespace.sh` to preserve host–namespace affinity across calls |
+| `vpc_id` | many | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
+| `public_vlan` | `assign-ip`, `release-ip` | Public IP VLAN tag (for example `101`) |
+| `network_id` | most | Network ID — CHOSEN_ID for veth names is `<vpc_id>` when VPC, else `<network_id>` |
+| `extension_ip` | `implement-network`, `config-dhcp-subnet`, `config-dns-subnet`, `restore-network` | Dedicated IP for DHCP/DNS/metadata service when it differs from the gateway |
+| `current_details` | `ensure-network-device` | Previous selected-device JSON, used to preserve host affinity |
 
 ### Action parameters (custom-action only)
 
-Caller-supplied parameters from `runNetworkCustomAction` are passed as a JSON
-object via the `--action-params` CLI argument:
+Custom-action parameters are embedded in the JSON payload file under
+`action-params`. Hook scripts should read and decode the payload file directly
+instead of expecting individual `--action-params` CLI arguments.
 
-```bash
-network-namespace.sh custom-action \
-    --network-id <id> \
-    --action <name> \
-    --action-params '{"key1":"value1","key2":"value2"}' \
-    --physical-network-extension-details '<json>' \
-    --network-extension-details '<json>'
+Example payload excerpt:
+
+```json
+{
+  "action": "dump-config",
+  "network_id": "123",
+  "action-params": {
+    "key1": "value1",
+    "key2": "value2"
+  }
+}
 ```
-
-`network-namespace-wrapper.sh` receives `--action-params` and forwards it
-unchanged to hook scripts.  Hook scripts should decode the JSON themselves
-(e.g. using `jq`).
 
 ---
 
@@ -1487,17 +1514,13 @@ cmk runNetworkCustomAction networkid=<network-uuid> actionid=<pbr-add-rule-id> \
 CloudStack calls `NetworkExtensionElement.runCustomAction()`, which issues:
 ```bash
 network-namespace.sh custom-action \
-    --network-id <id> \
-    --action dump-config \
-    --action-params '{"threshold":"90"}' \
-    --physical-network-extension-details '<json>' \
-    --network-extension-details '<json>'
+    <payload-file> \
+    <timeout-seconds>
 ```
 
 `network-namespace.sh` SSHes to the device and runs `network-namespace-wrapper.sh`
-with identical arguments.  The wrapper parses `--action-params` and dispatches
-it to the built-in handler or hook script as the `--action-params` CLI
-argument; hook scripts should parse the JSON argument as needed.
+with the same `<command> <payload-file> <timeout-seconds>` shape. The wrapper
+extracts `action`, `action-params`, and extension-details fields from the payload.
 
 ---
 

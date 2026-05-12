@@ -69,11 +69,15 @@
 #   CS_EXTNET_<networkId>_POST – POSTROUTING SNAT chain
 #   CS_EXTNET_FWD_<networkId>  – FORWARD filter chain
 #
-# CLI arguments (forwarded by network-namespace.sh):
-#   --physical-network-extension-details <json>
-#       kvmnetworklabel, public_kvmnetworklabel, hosts, username, …
-#   --network-extension-details <json>
-#       host, namespace, …
+# Invocation (forwarded by network-namespace.sh):
+#   network-namespace-wrapper.sh <command> <payload-file> <timeout-seconds>
+#
+# Standard payload envelope includes top-level:
+#   physical-network-extension-details
+#   network-extension-details
+#   payload               # command-specific keys
+#
+# For custom-action the payload is flat (command-specific keys are top-level).
 ##############################################################################
 
 set -e
@@ -102,12 +106,40 @@ _json_get() {
     printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | cut -d'"' -f4 || true
 }
 
+_payload_json_get() {
+    # _payload_json_get <payload-file> <dot.path> -> value or compact JSON for objects
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as fh:
+    data = json.load(fh)
+cur = data
+for part in sys.argv[2].split('.'):
+    if isinstance(cur, dict):
+        cur = cur.get(part)
+    else:
+        cur = None
+    if cur is None:
+        break
+if cur is None:
+    print("")
+elif isinstance(cur, (dict, list)):
+    print(json.dumps(cur, separators=(",", ":")))
+else:
+    print(str(cur))
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Pre-scan all arguments for the two JSON blobs.
 # ---------------------------------------------------------------------------
 
 PHYS_DETAILS="${CS_PHYSICAL_NETWORK_EXTENSION_DETAILS:-{}}"
 EXTENSION_DETAILS="${CS_NETWORK_EXTENSION_DETAILS:-{}}"
+
+if [ $# -ge 3 ] && [ -f "$2" ]; then
+    PHYS_DETAILS=$(_payload_json_get "$2" "physical-network-extension-details")
+    EXTENSION_DETAILS=$(_payload_json_get "$2" "network-extension-details")
+fi
 
 _pre_scan_args() {
     local i=1
@@ -431,91 +463,46 @@ ensure_jump() {
 ##############################################################################
 
 parse_args() {
-    NETWORK_ID=""
-    NAMESPACE=""
-    VPC_ID=""
-    CHOSEN_ID=""
-    VLAN=""
-    GATEWAY=""
-    CIDR=""
-    PUBLIC_IP=""
-    PRIVATE_IP=""
-    PUBLIC_PORT=""
-    PRIVATE_PORT=""
-    PROTOCOL=""
-    SOURCE_NAT="false"
-    PUBLIC_GATEWAY=""
-    PUBLIC_CIDR=""
-    PUBLIC_VLAN=""
-    # --- new fields ---
-    MAC=""
-    HOSTNAME=""
-    DNS_SERVER=""
-    NIC_ID=""
-    DHCP_OPTIONS_JSON="{}"
-    VM_IP=""
-    USERDATA=""
-    PASSWORD=""
-    SSH_KEY=""
-    HYPERVISOR_HOSTNAME=""
-    LB_RULES_JSON="[]"
-    DEFAULT_NIC="true"
-    VM_DATA=""
-    VM_DATA_FILE=""
-    DOMAIN=""
-    EXTENSION_IP=""
-    RESTORE_DATA=""
-    RESTORE_DATA_FILE=""
-    FW_RULES_JSON=""
-    FW_RULES_FILE=""
-    ACL_RULES_JSON=""
-    ACL_RULES_FILE=""
+    local payload_file="$1"
 
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --network-id)          NETWORK_ID="$2";         shift 2 ;;
-            --namespace)           NAMESPACE="$2";           shift 2 ;;
-            --vpc-id)              VPC_ID="$2";              shift 2 ;;
-            --vlan)                VLAN="$2";                shift 2 ;;
-            --gateway)             GATEWAY="$2";             shift 2 ;;
-            --cidr)                CIDR="$2";                shift 2 ;;
-            --public-ip)           PUBLIC_IP="$2";           shift 2 ;;
-            --private-ip)          PRIVATE_IP="$2";          shift 2 ;;
-            --public-port)         PUBLIC_PORT="$2";         shift 2 ;;
-            --private-port)        PRIVATE_PORT="$2";        shift 2 ;;
-            --protocol)            PROTOCOL="$2";            shift 2 ;;
-            --source-nat)          SOURCE_NAT="$2";          shift 2 ;;
-            --public-gateway)      PUBLIC_GATEWAY="$2";      shift 2 ;;
-            --public-cidr)         PUBLIC_CIDR="$2";         shift 2 ;;
-            --public-vlan)         PUBLIC_VLAN="$2";         shift 2 ;;
-            --mac)                 MAC="$2";                 shift 2 ;;
-            --hostname)            HOSTNAME="$2";            shift 2 ;;
-            --dns)                 DNS_SERVER="$2";          shift 2 ;;
-            --nic-id)              NIC_ID="$2";              shift 2 ;;
-            --options)             DHCP_OPTIONS_JSON="$2";   shift 2 ;;
-            --ip)                  VM_IP="$2";               shift 2 ;;
-            --userdata)            USERDATA="$2";            shift 2 ;;
-            --password)            PASSWORD="$2";            shift 2 ;;
-            --sshkey)              SSH_KEY="$2";             shift 2 ;;
-            --hypervisor-hostname) HYPERVISOR_HOSTNAME="$2"; shift 2 ;;
-            --lb-rules)            LB_RULES_JSON="$2";       shift 2 ;;
-            --default-nic)         DEFAULT_NIC="$2";         shift 2 ;;
-            --vm-data)             VM_DATA="$2";             shift 2 ;;
-            --vm-data-file)        VM_DATA_FILE="$2";        shift 2 ;;
-            --domain)              DOMAIN="$2";              shift 2 ;;
-            --extension-ip)        EXTENSION_IP="$2";        shift 2 ;;
-            --restore-data)        RESTORE_DATA="$2";        shift 2 ;;
-            --restore-data-file)   RESTORE_DATA_FILE="$2";   shift 2 ;;
-            --fw-rules)            FW_RULES_JSON="$2";       shift 2 ;;
-            --fw-rules-file)       FW_RULES_FILE="$2";       shift 2 ;;
-            --acl-rules)           ACL_RULES_JSON="$2";      shift 2 ;;
-            --acl-rules-file)      ACL_RULES_FILE="$2";      shift 2 ;;
-            # consumed by _pre_scan_args — skip silently
-            --physical-network-extension-details|--network-extension-details)
-                                   shift 2 ;;
-            *)                     shift ;;
-        esac
-    done
+    NETWORK_ID=$(_payload_json_get "${payload_file}" "payload.network_id")
+    NAMESPACE=$(_payload_json_get "${payload_file}" "payload.namespace")
+    VPC_ID=$(_payload_json_get "${payload_file}" "payload.vpc_id")
+    VLAN=$(_payload_json_get "${payload_file}" "payload.vlan")
+    GATEWAY=$(_payload_json_get "${payload_file}" "payload.gateway")
+    CIDR=$(_payload_json_get "${payload_file}" "payload.cidr")
+    PUBLIC_IP=$(_payload_json_get "${payload_file}" "payload.public_ip")
+    PRIVATE_IP=$(_payload_json_get "${payload_file}" "payload.private_ip")
+    PUBLIC_PORT=$(_payload_json_get "${payload_file}" "payload.public_port")
+    PRIVATE_PORT=$(_payload_json_get "${payload_file}" "payload.private_port")
+    PROTOCOL=$(_payload_json_get "${payload_file}" "payload.protocol")
+    SOURCE_NAT=$(_payload_json_get "${payload_file}" "payload.source_nat")
+    PUBLIC_GATEWAY=$(_payload_json_get "${payload_file}" "payload.public_gateway")
+    PUBLIC_CIDR=$(_payload_json_get "${payload_file}" "payload.public_cidr")
+    PUBLIC_VLAN=$(_payload_json_get "${payload_file}" "payload.public_vlan")
+    MAC=$(_payload_json_get "${payload_file}" "payload.mac")
+    HOSTNAME=$(_payload_json_get "${payload_file}" "payload.hostname")
+    DNS_SERVER=$(_payload_json_get "${payload_file}" "payload.dns")
+    NIC_ID=$(_payload_json_get "${payload_file}" "payload.nic_id")
+    DHCP_OPTIONS_JSON=$(_payload_json_get "${payload_file}" "payload.options")
+    VM_IP=$(_payload_json_get "${payload_file}" "payload.ip")
+    USERDATA=$(_payload_json_get "${payload_file}" "payload.userdata")
+    PASSWORD=$(_payload_json_get "${payload_file}" "payload.password")
+    SSH_KEY=$(_payload_json_get "${payload_file}" "payload.sshkey")
+    HYPERVISOR_HOSTNAME=$(_payload_json_get "${payload_file}" "payload.hypervisor_hostname")
+    LB_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.lb_rules")
+    DEFAULT_NIC=$(_payload_json_get "${payload_file}" "payload.default_nic")
+    VM_DATA=$(_payload_json_get "${payload_file}" "payload.vm_data")
+    DOMAIN=$(_payload_json_get "${payload_file}" "payload.domain")
+    EXTENSION_IP=$(_payload_json_get "${payload_file}" "payload.extension_ip")
+    RESTORE_DATA=$(_payload_json_get "${payload_file}" "payload.restore_data")
+    FW_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.fw_rules")
+    ACL_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.acl_rules")
+
+    [ -z "${SOURCE_NAT}" ] && SOURCE_NAT="false"
+    [ -z "${DHCP_OPTIONS_JSON}" ] && DHCP_OPTIONS_JSON="{}"
+    [ -z "${LB_RULES_JSON}" ] && LB_RULES_JSON="[]"
+    [ -z "${DEFAULT_NIC}" ] && DEFAULT_NIC="true"
 
     [ -z "${NETWORK_ID}" ] && die "Missing --network-id"
 
@@ -2240,10 +2227,10 @@ cmd_save_vm_data() {
     log "save-vm-data: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ]   && die "save-vm-data: missing --ip"
 
-    local vm_data_file="${VM_DATA_FILE}"
+    local vm_data_file=""
     local cleanup_vm_data_file="false"
     if [ -z "${vm_data_file}" ]; then
-        [ -z "${VM_DATA}" ] && die "save-vm-data: missing --vm-data or --vm-data-file"
+        [ -z "${VM_DATA}" ] && die "save-vm-data: missing payload.vm_data"
         vm_data_file=$(mktemp /tmp/cs-extnet-vm-data-XXXXXX)
         cleanup_vm_data_file="true"
         printf '%s' "${VM_DATA}" > "${vm_data_file}"
@@ -2417,7 +2404,7 @@ cmd_apply_fw_rules() {
     acquire_lock "${NETWORK_ID}"
     log "apply-fw-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
-    local fw_rules_file="${FW_RULES_FILE}"
+    local fw_rules_file=""
     local cleanup_fw_rules_file="false"
     if [ -z "${fw_rules_file}" ]; then
         fw_rules_file=$(mktemp /tmp/cs-extnet-fw-rules-XXXXXX)
@@ -2918,28 +2905,23 @@ raw = os.environ.get("RAW_OUTPUT", "")
 rows = [line.rstrip() for line in raw.splitlines() if line.strip()]
 
 if action == "pbr-list-tables":
-    message = []
+    data = []
     for row in rows:
         parts = row.split(None, 1)
         if len(parts) == 2 and parts[0].isdigit():
-            message.append({"id": parts[0], "name": parts[1]})
+            data.append({"id": parts[0], "name": parts[1]})
         else:
-            # Preserve raw rows that do not match the standard "<id> <name>" format.
-            message.append({"result": row})
+            data.append({"result": row})
+    print(json.dumps({"status": "success", "message": data}))
 elif action == "pbr-list-routes":
-    message = [{"route": row} for row in rows]
+    data = [{"route": row} for row in rows]
+    print(json.dumps({"status": "success", "message": data}))
 elif action == "pbr-list-rules":
-    message = [{"rule": row} for row in rows]
-elif rows:
-    message = [{"action": action, "result": row} for row in rows]
+    data = [{"rule": row} for row in rows]
+    print(json.dumps({"status": "success", "message": data}))
 else:
-    message = [{"action": action, "result": "OK"}]
-
-print(json.dumps({
-    "status": "success",
-    "printmessage": "true",
-    "message": message
-}))
+    msg = rows[0] if rows else f"{action}: OK"
+    print(json.dumps({"status": "success", "message": msg}))
 PYEOF
 }
 
@@ -2948,8 +2930,17 @@ cmd_custom_action() {
     VPC_ID=""
     ACTION_NAME=""
     ACTION_PARAMS_JSON="{}"
-    while [ $# -gt 0 ]; do
-        case "$1" in
+    if [ $# -ge 1 ] && [ -f "$1" ]; then
+        local payload_file="$1"
+        NETWORK_ID=$(_payload_json_get "${payload_file}" "network_id")
+        VPC_ID=$(_payload_json_get "${payload_file}" "vpc_id")
+        ACTION_NAME=$(_payload_json_get "${payload_file}" "action")
+        ACTION_PARAMS_JSON=$(_payload_json_get "${payload_file}" "action-params")
+        [ -z "${ACTION_PARAMS_JSON}" ] && ACTION_PARAMS_JSON=$(_payload_json_get "${payload_file}" "action_params")
+        [ -z "${ACTION_PARAMS_JSON}" ] && ACTION_PARAMS_JSON="{}"
+    else
+        while [ $# -gt 0 ]; do
+            case "$1" in
             --network-id)    NETWORK_ID="$2";               shift 2 ;;
             --vpc-id)        VPC_ID="$2";                   shift 2 ;;
             --action)        ACTION_NAME="$2";               shift 2 ;;
@@ -2957,8 +2948,9 @@ cmd_custom_action() {
             --physical-network-extension-details|--network-extension-details)
                              shift 2 ;;
             *)               shift ;;
-        esac
-    done
+            esac
+        done
+    fi
     [ -z "${NETWORK_ID}" ] && [ -z "${VPC_ID}" ] && die "custom-action: missing --network-id or --vpc-id"
     [ -z "${ACTION_NAME}" ] && die "custom-action: missing --action"
 
@@ -3074,10 +3066,10 @@ cmd_restore_network() {
     acquire_lock "${NETWORK_ID}"
     log "restore-network: network=${NETWORK_ID} ns=${NAMESPACE}"
 
-    local restore_data_file="${RESTORE_DATA_FILE}"
+    local restore_data_file=""
     local cleanup_restore_data_file="false"
     if [ -z "${restore_data_file}" ]; then
-        [ -z "${RESTORE_DATA}" ] && die "restore-network: missing --restore-data or --restore-data-file"
+        [ -z "${RESTORE_DATA}" ] && die "restore-network: missing payload.restore_data"
         restore_data_file=$(mktemp /tmp/cs-extnet-restore-data-XXXXXX)
         cleanup_restore_data_file="true"
         printf '%s' "${RESTORE_DATA}" > "${restore_data_file}"
@@ -3319,33 +3311,20 @@ PYFLAGSEOF
 ##############################################################################
 
 parse_vpc_args() {
-    VPC_ID=""
-    NAMESPACE=""
-    VPC_CIDR=""
-    PUBLIC_IP=""
-    PUBLIC_VLAN=""
-    PUBLIC_GATEWAY=""
-    PUBLIC_CIDR=""
-    SOURCE_NAT="false"
+    local payload_file="$1"
 
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --vpc-id)              VPC_ID="$2";          shift 2 ;;
-            --namespace)           NAMESPACE="$2";        shift 2 ;;
-            --cidr)                VPC_CIDR="$2";         shift 2 ;;
-            --public-ip)           PUBLIC_IP="$2";        shift 2 ;;
-            --public-vlan)         PUBLIC_VLAN="$2";      shift 2 ;;
-            --public-gateway)      PUBLIC_GATEWAY="$2";   shift 2 ;;
-            --public-cidr)         PUBLIC_CIDR="$2";      shift 2 ;;
-            --source-nat)          SOURCE_NAT="$2";       shift 2 ;;
-            # consumed by _pre_scan_args — skip silently
-            --physical-network-extension-details|--network-extension-details)
-                                   shift 2 ;;
-            *)                     shift ;;
-        esac
-    done
+    VPC_ID=$(_payload_json_get "${payload_file}" "payload.vpc_id")
+    NAMESPACE=$(_payload_json_get "${payload_file}" "payload.namespace")
+    VPC_CIDR=$(_payload_json_get "${payload_file}" "payload.cidr")
+    PUBLIC_IP=$(_payload_json_get "${payload_file}" "payload.public_ip")
+    PUBLIC_VLAN=$(_payload_json_get "${payload_file}" "payload.public_vlan")
+    PUBLIC_GATEWAY=$(_payload_json_get "${payload_file}" "payload.public_gateway")
+    PUBLIC_CIDR=$(_payload_json_get "${payload_file}" "payload.public_cidr")
+    SOURCE_NAT=$(_payload_json_get "${payload_file}" "payload.source_nat")
 
-    [ -z "${VPC_ID}" ] && die "Missing --vpc-id"
+    [ -z "${SOURCE_NAT}" ] && SOURCE_NAT="false"
+
+    [ -z "${VPC_ID}" ] && die "Missing payload.vpc_id"
 
     if [ -z "${NAMESPACE}" ]; then
         local NS_FROM_DETAILS
@@ -3631,8 +3610,8 @@ cmd_destroy_vpc() {
 ##############################################################################
 # Command: apply-network-acl
 # Applies VPC network ACL rules to the FORWARD chain inside the namespace.
-# Rules are passed as a Base64-encoded JSON array via --acl-rules-file or
-# --acl-rules.  Each rule has:
+# Rules are passed as a Base64-encoded JSON array in payload.acl_rules.
+# Each rule has:
 #   number, action (allow|deny), trafficType (ingress|egress),
 #   protocol, portStart, portEnd, icmpType, icmpCode, sourceCidrs[]
 ##############################################################################
@@ -3643,7 +3622,7 @@ cmd_apply_network_acl() {
     acquire_lock "${NETWORK_ID}"
     log "apply-network-acl: network=${NETWORK_ID} ns=${NAMESPACE} cidr=${CIDR}"
 
-    local acl_rules_file="${ACL_RULES_FILE}"
+    local acl_rules_file=""
     local cleanup_acl_file="false"
     if [ -z "${acl_rules_file}" ]; then
         acl_rules_file=$(mktemp /tmp/cs-extnet-acl-rules-XXXXXX)
