@@ -1041,6 +1041,55 @@ network-namespace-wrapper.sh delete-port-forward \
 
 Removes the DNAT and FORWARD rules added by `add-port-forward`.
 
+### `prepare-nic`
+
+Called when a VM NIC is being attached to the network (before the VM boots).
+
+```
+network-namespace-wrapper.sh prepare-nic \
+    --network-id <id>       \
+    --vlan <vlan-id>        \
+    --mac <mac>             \
+    --ip <vm-ip>            \
+    [--hostname <name>]     \
+    [--default-nic true|false] \
+    [--gateway <gw>]        \
+    [--cidr <cidr>]         \
+    [--extension-ip <ip>]   \
+    [--vpc-id <vpc-id>]
+```
+
+Actions (all idempotent; silently skipped when the service is not yet configured):
+1. If dnsmasq DHCP is active for the network — add a static lease
+   `<mac>,<ip>[,<hostname>],infinite` to the hosts file.  For secondary NICs
+   (`default_nic=false`) the gateway DHCP option is suppressed via a
+   `set:norouter_<mac_tag>` tag so the VM does not receive a competing default
+   route from this NIC.
+2. If dnsmasq DNS is active — add a `<ip> <hostname>` line to the hosts file.
+3. Sends a SIGHUP / reload to dnsmasq so the new entries take effect
+   immediately.
+
+### `release-nic`
+
+Called when a VM NIC is being detached from the network (after the VM stops).
+
+```
+network-namespace-wrapper.sh release-nic \
+    --network-id <id>  \
+    --mac <mac>        \
+    --ip <vm-ip>       \
+    [--vpc-id <vpc-id>]
+```
+
+Actions:
+1. Remove the MAC's DHCP static lease and any associated gateway-suppression
+   option from dnsmasq.
+2. Remove the VM's hostname from the dnsmasq hosts file.
+3. Reload dnsmasq.
+4. Delete the per-VM metadata directory
+   `${STATE_DIR}/network-<id>/metadata/<vm-ip>/`.
+5. Remove the VM's password entry from the passwords file.
+
 ### `apply-fw-rules`
 
 Called when CloudStack applies or removes firewall rules for the network.

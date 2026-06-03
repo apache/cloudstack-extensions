@@ -2045,6 +2045,121 @@ cmd_remove_dns_entry() {
 }
 
 ##############################################################################
+# Command: prepare-nic
+# Called when a VM NIC is being attached to the network (before VM boots).
+# Idempotently adds DHCP and DNS entries so the NIC is reachable as soon
+# as the VM starts.  A no-op when dnsmasq is not yet configured.
+##############################################################################
+
+cmd_prepare_nic() {
+    parse_args "$@"
+    _load_state
+    acquire_lock "${NETWORK_ID}"
+    log "prepare-nic: network=${NETWORK_ID} ns=${NAMESPACE} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
+
+    local dnsmasq_reloaded="false"
+
+    # ---- DHCP entry ----
+    local dhcp_hosts; dhcp_hosts=$(_dnsmasq_dhcp_hosts)
+    if [ -n "${MAC}" ] && [ -n "${VM_IP}" ] && [ -f "${dhcp_hosts}" ]; then
+        local mac_tag; mac_tag=$(echo "${MAC}" | tr ':' '_' | tr '[:upper:]' '[:lower:]')
+        grep -v "${MAC}" "${dhcp_hosts}" > "${dhcp_hosts}.tmp" 2>/dev/null || true
+        mv "${dhcp_hosts}.tmp" "${dhcp_hosts}"
+        if [ "${DEFAULT_NIC}" = "false" ]; then
+            if [ -n "${HOSTNAME}" ]; then
+                echo "set:norouter_${mac_tag},${MAC},${VM_IP},${HOSTNAME},infinite" >> "${dhcp_hosts}"
+            else
+                echo "set:norouter_${mac_tag},${MAC},${VM_IP},infinite" >> "${dhcp_hosts}"
+            fi
+            local dhcp_opts; dhcp_opts=$(_dnsmasq_dhcp_opts)
+            touch "${dhcp_opts}"
+            grep -v "tag:norouter_${mac_tag}" "${dhcp_opts}" > "${dhcp_opts}.tmp" 2>/dev/null || true
+            mv "${dhcp_opts}.tmp" "${dhcp_opts}"
+            echo "dhcp-option=tag:norouter_${mac_tag},option:router,0.0.0.0" >> "${dhcp_opts}"
+            log "prepare-nic: non-default NIC ${MAC} (${VM_IP}) — gateway suppressed"
+        else
+            if [ -n "${HOSTNAME}" ]; then
+                echo "${MAC},${VM_IP},${HOSTNAME},infinite" >> "${dhcp_hosts}"
+            else
+                echo "${MAC},${VM_IP},infinite" >> "${dhcp_hosts}"
+            fi
+        fi
+        dnsmasq_reloaded="true"
+    fi
+
+    # ---- DNS entry ----
+    local hosts; hosts=$(_dnsmasq_hosts)
+    if [ -n "${VM_IP}" ] && [ -n "${HOSTNAME}" ] && [ -f "${hosts}" ]; then
+        grep -v "^${VM_IP}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
+        mv "${hosts}.tmp" "${hosts}"
+        echo "${VM_IP} ${HOSTNAME}" >> "${hosts}"
+        dnsmasq_reloaded="true"
+    fi
+
+    [ "${dnsmasq_reloaded}" = "true" ] && _svc_start_or_reload_dnsmasq
+
+    release_lock
+    log "prepare-nic: done network=${NETWORK_ID} mac=${MAC} ip=${VM_IP}"
+}
+
+##############################################################################
+# Command: release-nic
+# Called when a VM NIC is being detached from the network (after VM stops).
+# Removes DHCP and DNS entries and cleans up per-VM metadata files.
+##############################################################################
+
+cmd_release_nic() {
+    parse_args "$@"
+    _load_state
+    acquire_lock "${NETWORK_ID}"
+    log "release-nic: network=${NETWORK_ID} ns=${NAMESPACE} mac=${MAC} ip=${VM_IP}"
+
+    local dnsmasq_reloaded="false"
+
+    # ---- Remove DHCP entry ----
+    local dhcp_hosts; dhcp_hosts=$(_dnsmasq_dhcp_hosts)
+    if [ -n "${MAC}" ] && [ -f "${dhcp_hosts}" ]; then
+        local mac_tag; mac_tag=$(echo "${MAC}" | tr ':' '_' | tr '[:upper:]' '[:lower:]')
+        grep -v "${MAC}" "${dhcp_hosts}" > "${dhcp_hosts}.tmp" 2>/dev/null || true
+        mv "${dhcp_hosts}.tmp" "${dhcp_hosts}"
+        local dhcp_opts; dhcp_opts=$(_dnsmasq_dhcp_opts)
+        if [ -f "${dhcp_opts}" ]; then
+            grep -v "tag:norouter_${mac_tag}" "${dhcp_opts}" > "${dhcp_opts}.tmp" 2>/dev/null || true
+            mv "${dhcp_opts}.tmp" "${dhcp_opts}"
+        fi
+        dnsmasq_reloaded="true"
+    fi
+
+    # ---- Remove DNS entry ----
+    local hosts; hosts=$(_dnsmasq_hosts)
+    if [ -n "${VM_IP}" ] && [ -f "${hosts}" ]; then
+        grep -v "^${VM_IP}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
+        mv "${hosts}.tmp" "${hosts}"
+        dnsmasq_reloaded="true"
+    fi
+
+    [ "${dnsmasq_reloaded}" = "true" ] && _svc_start_or_reload_dnsmasq
+
+    # ---- Remove per-VM metadata ----
+    if [ -n "${VM_IP}" ]; then
+        local vm_meta_dir; vm_meta_dir="$(_metadata_dir)/${VM_IP}"
+        if [ -d "${vm_meta_dir}" ]; then
+            rm -rf "${vm_meta_dir}"
+            log "release-nic: removed metadata for ${VM_IP}"
+        fi
+        # Remove password entry
+        local passwd_f; passwd_f=$(_passwd_file)
+        if [ -f "${passwd_f}" ]; then
+            grep -v "^${VM_IP}=" "${passwd_f}" > "${passwd_f}.tmp" 2>/dev/null || true
+            mv "${passwd_f}.tmp" "${passwd_f}"
+        fi
+    fi
+
+    release_lock
+    log "release-nic: done network=${NETWORK_ID} mac=${MAC} ip=${VM_IP}"
+}
+
+##############################################################################
 # Command: save-userdata
 # Write user-data for a VM; start/reload apache2.
 ##############################################################################
@@ -3719,6 +3834,9 @@ case "${COMMAND}" in
     delete-static-nat)        cmd_delete_static_nat        "$@" ;;
     add-port-forward)         cmd_add_port_forward         "$@" ;;
     delete-port-forward)      cmd_delete_port_forward      "$@" ;;
+    # NIC lifecycle
+    prepare-nic)              cmd_prepare_nic              "$@" ;;
+    release-nic)              cmd_release_nic              "$@" ;;
     # DHCP / DNS (dnsmasq)
     config-dhcp-subnet)       cmd_config_dhcp_subnet       "$@" ;;
     remove-dhcp-subnet)       cmd_remove_dhcp_subnet       "$@" ;;
@@ -3747,6 +3865,7 @@ case "${COMMAND}" in
              "implement-vpc|update-vpc-source-nat-ip|shutdown-vpc|destroy-vpc|" \
              "assign-ip|release-ip|" \
              "add-static-nat|delete-static-nat|add-port-forward|delete-port-forward|" \
+             "prepare-nic|release-nic|" \
              "config-dhcp-subnet|remove-dhcp-subnet|add-dhcp-entry|remove-dhcp-entry|set-dhcp-options|" \
              "config-dns-subnet|remove-dns-subnet|add-dns-entry|remove-dns-entry|" \
              "save-userdata|save-password|save-sshkey|save-hypervisor-hostname|save-vm-data|restore-network|" \
