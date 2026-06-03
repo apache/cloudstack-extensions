@@ -484,7 +484,6 @@ parse_args() {
     HOSTNAME=$(_payload_json_get "${payload_file}" "payload.hostname")
     DNS_SERVER=$(_payload_json_get "${payload_file}" "payload.dns")
     NIC_ID=$(_payload_json_get "${payload_file}" "payload.nic_id")
-    DHCP_OPTIONS_JSON=$(_payload_json_get "${payload_file}" "payload.options")
     VM_IP=$(_payload_json_get "${payload_file}" "payload.ip")
     USERDATA=$(_payload_json_get "${payload_file}" "payload.userdata")
     PASSWORD=$(_payload_json_get "${payload_file}" "payload.password")
@@ -500,7 +499,6 @@ parse_args() {
     ACL_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.acl_rules")
 
     [ -z "${SOURCE_NAT}" ] && SOURCE_NAT="false"
-    [ -z "${DHCP_OPTIONS_JSON}" ] && DHCP_OPTIONS_JSON="{}"
     [ -z "${LB_RULES_JSON}" ] && LB_RULES_JSON="[]"
     [ -z "${DEFAULT_NIC}" ] && DEFAULT_NIC="true"
 
@@ -1995,56 +1993,6 @@ cmd_remove_dhcp_entry() {
     fi
     release_lock
     log "remove-dhcp-entry: done mac=${MAC}"
-}
-
-##############################################################################
-# Command: set-dhcp-options
-# Set extra DHCP options for a NIC (by NIC ID as dnsmasq tag).
-##############################################################################
-
-cmd_set_dhcp_options() {
-    parse_args "$@"
-    _load_state
-    acquire_lock "${NETWORK_ID}"
-    log "set-dhcp-options: network=${NETWORK_ID} nic=${NIC_ID}"
-
-    local dhcp_opts; dhcp_opts=$(_dnsmasq_dhcp_opts)
-    mkdir -p "$(_dnsmasq_dir)"
-    touch "${dhcp_opts}"
-
-    # Parse JSON options with Python3 and write to opts file
-    python3 - "${NIC_ID}" "${DHCP_OPTIONS_JSON}" "${dhcp_opts}" << 'PYEOF'
-import json, sys, os
-
-nic_id   = sys.argv[1]
-opts_str = sys.argv[2]
-optsfile = sys.argv[3]
-
-try:
-    opts = json.loads(opts_str)
-except Exception:
-    opts = {}
-
-# Read existing lines; drop any previously set for this nic
-try:
-    with open(optsfile) as f:
-        lines = f.readlines()
-except FileNotFoundError:
-    lines = []
-
-marker = f"# nic:{nic_id}:"
-lines = [l for l in lines if not l.startswith(marker)]
-
-for code, value in opts.items():
-    lines.append(f"{marker}\ndhcp-option=tag:{nic_id},{code},{value}\n")
-
-with open(optsfile, 'w') as f:
-    f.writelines(lines)
-PYEOF
-
-    _svc_start_or_reload_dnsmasq
-    release_lock
-    log "set-dhcp-options: done nic=${NIC_ID}"
 }
 
 ##############################################################################
@@ -3787,7 +3735,6 @@ case "${COMMAND}" in
     remove-dhcp-subnet)       cmd_remove_dhcp_subnet       "$@" ;;
     add-dhcp-entry)           cmd_add_dhcp_entry           "$@" ;;
     remove-dhcp-entry)        cmd_remove_dhcp_entry        "$@" ;;
-    set-dhcp-options)         cmd_set_dhcp_options         "$@" ;;
     config-dns-subnet)        cmd_config_dns_subnet        "$@" ;;
     remove-dns-subnet)        cmd_remove_dns_subnet        "$@" ;;
     add-dns-entry)            cmd_add_dns_entry            "$@" ;;
