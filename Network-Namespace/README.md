@@ -1049,11 +1049,10 @@ Called when CloudStack applies or removes firewall rules for the network.
 network-namespace-wrapper.sh apply-fw-rules \
     --network-id <id> \
     --vlan <vlan-id> \
-    { --fw-rules <base64-json> | --fw-rules-file <path-on-kvm-host> } \
     [--vpc-id <vpc-id>]
 ```
 
-The `--fw-rules` value is a Base64-encoded JSON object:
+The `fw_rules` field in the payload is a JSON object:
 ```json
 {
   "default_egress_allow": true,
@@ -1096,11 +1095,10 @@ Apply Network ACL (Access Control List) rules for VPC networks.
 network-namespace-wrapper.sh apply-network-acl \
     --network-id <id> \
     --vlan <vlan-id> \
-    { --acl-rules <base64-json> | --acl-rules-file <path-on-kvm-host> } \
     [--vpc-id <vpc-id>]
 ```
 
-The `--acl-rules` value is a Base64-encoded JSON array of ACL rule objects:
+The `acl_rules` field in the payload is a JSON array of ACL rule objects:
 ```json
 [
   {
@@ -1247,28 +1245,24 @@ Called on network restart and VM deploy.
 ```
 network-namespace-wrapper.sh save-vm-data \
     --network-id <id>  \
-    --ip <vm-ip>       \
-    { --vm-data <base64-json> | --vm-data-file <path-on-kvm-host> }
+    --ip <vm-ip>
 ```
 
-The `--vm-data` value (or the contents of `--vm-data-file`) is a Base64-encoded
-JSON array of `{dir, file, content}` entries (same format as `generateVmData()`
-in the Java layer).  Writes files under
+The `vm_data` field in the payload is a JSON array of `{dir, file, content}`
+entries (same format as `generateVmData()` in the Java layer).  Each `content`
+value is a plain UTF-8 string.  Writes files under
 `${STATE_DIR}/network-<id>/metadata/<vm-ip>/latest/`.  After writing, starts or
 reloads both the **apache2 metadata HTTP service** (port 80) and the
 **VR-compatible password server** (port 8080) inside the namespace.
-
-> `network-namespace.sh` uploads the single command payload file to the KVM host;
-> nested fields like `vm_data` stay inside that payload JSON.
 
 ### `save-userdata` / `save-password` / `save-sshkey` / `save-hypervisor-hostname`
 
 Granular variants that write individual VM metadata fields:
 
 ```
-network-namespace-wrapper.sh save-userdata       --network-id <id> --ip <vm-ip> --userdata <base64>
+network-namespace-wrapper.sh save-userdata       --network-id <id> --ip <vm-ip> --userdata <plain>
 network-namespace-wrapper.sh save-password       --network-id <id> --ip <vm-ip> --password <plain>
-network-namespace-wrapper.sh save-sshkey         --network-id <id> --ip <vm-ip> --sshkey <base64>
+network-namespace-wrapper.sh save-sshkey         --network-id <id> --ip <vm-ip> --sshkey <plain>
 network-namespace-wrapper.sh save-hypervisor-hostname \
     --network-id <id> --ip <vm-ip> --hypervisor-hostname <name>
 ```
@@ -1302,10 +1296,12 @@ per-VM calls.
 ```
 network-namespace-wrapper.sh restore-network \
     --network-id <id>          \
-    { --restore-data <base64-json> | --restore-data-file <path-on-kvm-host> } \
     [--gateway <gw>] [--cidr <cidr>] [--dns <dns>] \
     [--domain <dom>] [--extension-ip <ip>] [--vpc-id <vpc-id>]
 ```
+
+The `restore_data` field in the payload is a JSON object (see
+`buildRestoreNetworkData()` in `NetworkExtensionElement.java`).
 
 ### `custom-action`
 

@@ -2046,7 +2046,7 @@ cmd_remove_dns_entry() {
 
 ##############################################################################
 # Command: save-userdata
-# Write base64-decoded user-data for a VM; start/reload apache2.
+# Write user-data for a VM; start/reload apache2.
 ##############################################################################
 
 cmd_save_userdata() {
@@ -2060,8 +2060,7 @@ cmd_save_userdata() {
     mkdir -p "${vm_dir}"
 
     if [ -n "${USERDATA}" ]; then
-        printf '%s' "${USERDATA}" | base64 -d > "${vm_dir}/user-data" 2>/dev/null || \
-            printf '%s' "${USERDATA}" > "${vm_dir}/user-data"
+        printf '%s' "${USERDATA}" > "${vm_dir}/user-data"
     else
         # Create empty user-data file if USERDATA is empty
         rm -rf "${vm_dir}/user-data" && touch "${vm_dir}/user-data"
@@ -2104,7 +2103,7 @@ cmd_save_password() {
 
 ##############################################################################
 # Command: save-sshkey
-# Write a base64-encoded SSH public key for a VM.
+# Write an SSH public key for a VM.
 ##############################################################################
 
 cmd_save_sshkey() {
@@ -2116,11 +2115,9 @@ cmd_save_sshkey() {
 
     local meta_dir; meta_dir="$(_metadata_dir)/${VM_IP}/latest/meta-data"
     mkdir -p "${meta_dir}"
-    # SSH_KEY is base64-encoded by the Java caller.
     # All public keys for the VM are stored together in a single flat file
     # (one key per line) at latest/meta-data/public-keys.
-    printf '%s' "${SSH_KEY}" | base64 -d > "${meta_dir}/public-keys" 2>/dev/null || \
-        printf '%s' "${SSH_KEY}" > "${meta_dir}/public-keys"
+    printf '%s' "${SSH_KEY}" > "${meta_dir}/public-keys"
 
     _write_apache2_conf
     _svc_start_or_reload_apache2
@@ -2153,9 +2150,8 @@ cmd_save_hypervisor_hostname() {
 ##############################################################################
 # Command: save-vm-data
 # Write the full VM metadata/userdata/password set in one call.
-# --ip      <vm_ip>      IP address of the VM on this network
-# --vm-data <base64>     Base64-encoded JSON array of {dir,file,content} entries.
-#                        Each 'content' value is itself Base64-encoded bytes.
+# payload.vm_data  JSON array of {dir,file,content} entries.
+#                  Each 'content' value is a plain UTF-8 string.
 #
 # Path mapping from generateVmData() output:
 #   [userdata, user_data,   <bytes>]  → latest/user-data
@@ -2191,7 +2187,7 @@ cmd_save_vm_data() {
     touch "${passwd_f}"
 
     python3 - "${VM_IP}" "${meta_dir}" "${passwd_f}" "${vm_data_file}" << 'PYEOF'
-import base64, json, os, sys
+import json, os, sys
 
 vm_ip      = sys.argv[1]
 meta_dir   = sys.argv[2]
@@ -2200,32 +2196,28 @@ data_file  = sys.argv[4]
 
 try:
     with open(data_file, 'r', encoding='utf-8') as f:
-        data_b64 = f.read().strip()
+        data_json = f.read().strip()
 except Exception as e:
     print(f"save-vm-data: failed to read vm-data file: {e}", file=sys.stderr)
     sys.exit(1)
 
-# Decode the outer base64 wrapper, then parse the JSON array
+# Parse the JSON array directly (content is plain text, not base64-encoded)
 try:
-    entries = json.loads(base64.b64decode(data_b64).decode('utf-8'))
+    entries = json.loads(data_json)
 except Exception as e:
-    print(f"save-vm-data: failed to decode vm-data: {e}", file=sys.stderr)
+    print(f"save-vm-data: failed to parse vm-data: {e}", file=sys.stderr)
     sys.exit(1)
 
 password_written = None
 pub_keys = []  # accumulate all public-key entries; written as one flat file after the loop
 
 for entry in entries:
-    d    = entry.get('dir', '')
-    f    = entry.get('file', '')
-    c_b64 = entry.get('content', '')
-    if not c_b64:
+    d = entry.get('dir', '')
+    f = entry.get('file', '')
+    c = entry.get('content', '')
+    if not c:
         continue
-    # Each content value is base64-encoded actual bytes
-    try:
-        content = base64.b64decode(c_b64)
-    except Exception:
-        content = c_b64.encode('utf-8') if isinstance(c_b64, str) else b''
+    content = c.encode('utf-8') if isinstance(c, str) else c
 
     if not content:
         continue
@@ -2296,9 +2288,9 @@ PYEOF
 # Command: apply-fw-rules
 #
 # Rebuilds the per-network firewall chain CS_EXTNET_FWRULES_<networkId> from
-# scratch using a Base64-encoded JSON payload supplied via --fw-rules.
+# scratch using the JSON object supplied in payload.fw_rules.
 #
-# JSON payload structure (base64-decoded):
+# JSON payload structure (payload.fw_rules):
 # {
 #   "default_egress_allow": true|false,
 #   "cidr": "10.0.0.0/24",
@@ -2380,7 +2372,7 @@ cmd_apply_fw_rules() {
     # ---- 4. Build iptables rules via Python ----
     python3 - "${NAMESPACE}" "${fw_rules_file}" "${veth_n}" \
               "${fw_chain}" << 'PYEOF'
-import base64, json, re, subprocess, sys
+import json, re, subprocess, sys
 
 namespace = sys.argv[1]
 rules_file = sys.argv[2]
@@ -2389,7 +2381,7 @@ fw_chain  = sys.argv[4]   # filter table egress chain (CS_EXTNET_FWRULES_<N>)
 
 try:
     with open(rules_file, 'r', encoding='utf-8') as f:
-        rules_b64 = f.read().strip()
+        rules_json = f.read().strip()
 except Exception as e:
     print(f"apply-fw-rules: failed to read rules file: {e}", file=sys.stderr)
     sys.exit(1)
@@ -2414,13 +2406,13 @@ def iptm(*args):
     _run('mangle', *args)
 
 # ---------------------------------------------------------------------------
-# Decode payload
+# Parse payload
 # ---------------------------------------------------------------------------
-if rules_b64:
+if rules_json:
     try:
-        data = json.loads(base64.b64decode(rules_b64).decode('utf-8'))
+        data = json.loads(rules_json)
     except Exception as e:
-        print(f"apply-fw-rules: failed to decode --fw-rules: {e}", file=sys.stderr)
+        print(f"apply-fw-rules: failed to parse fw-rules: {e}", file=sys.stderr)
         sys.exit(1)
 else:
     data = {}
@@ -3002,7 +2994,7 @@ cmd_custom_action() {
 #
 # Required arguments:
 #   --network-id   <id>
-#   --restore-data <base64-json>   JSON: see buildRestoreNetworkData() in Java
+#   payload.restore_data  JSON object: see buildRestoreNetworkData() in Java
 #
 # Optional (for dnsmasq reconfiguration):
 #   --gateway <gw>  --cidr <cidr>  --dns <dns>  --domain <dom>  --extension-ip <ip>
@@ -3038,7 +3030,7 @@ cmd_restore_network() {
         "${dhcp_hosts}" "${dhcp_opts}" "${dns_hosts}" \
         "${meta_dir}" "${passwd_f}" \
         << 'PYEOF'
-import base64, json, os, sys
+import json, os, sys
 
 restore_file = sys.argv[1]
 dhcp_hosts_f = sys.argv[2]
@@ -3049,16 +3041,16 @@ passwd_f     = sys.argv[6]
 
 try:
     with open(restore_file, 'r', encoding='utf-8') as f:
-        restore_b64 = f.read().strip()
+        restore_json = f.read().strip()
 except Exception as e:
     print(f"restore-network: failed to read restore-data file: {e}", file=sys.stderr)
     sys.exit(1)
 
-# ---- Decode the outer base64, then parse JSON ----
+# ---- Parse JSON directly ----
 try:
-    data = json.loads(base64.b64decode(restore_b64).decode('utf-8'))
+    data = json.loads(restore_json)
 except Exception as e:
-    print(f"restore-network: failed to decode restore-data: {e}", file=sys.stderr)
+    print(f"restore-network: failed to parse restore-data: {e}", file=sys.stderr)
     sys.exit(1)
 
 dhcp_enabled     = data.get('dhcp_enabled', False)
@@ -3143,15 +3135,12 @@ if userdata_enabled:
         vm_count += 1
         pub_keys = []  # accumulate public keys; written as a single flat file after inner loop
         for entry in vm_data:
-            d     = entry.get('dir', '')
-            f_    = entry.get('file', '')
-            c_b64 = entry.get('content', '')
-            if not c_b64:
+            d  = entry.get('dir', '')
+            f_ = entry.get('file', '')
+            c  = entry.get('content', '')
+            if not c:
                 continue
-            try:
-                content = base64.b64decode(c_b64)
-            except Exception:
-                content = c_b64.encode('utf-8') if isinstance(c_b64, str) else b''
+            content = c.encode('utf-8') if isinstance(c, str) else c
 
             if not content:
                 continue
@@ -3205,10 +3194,10 @@ PYEOF
     # ------------------------------------------------------------------
     local _r_flags
     _r_flags=$(python3 - "${restore_data_file}" 2>/dev/null << 'PYFLAGSEOF'
-import base64, json, sys, pathlib
+import json, sys, pathlib
 try:
-    b64_data = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').strip()
-    d = json.loads(base64.b64decode(b64_data).decode('utf-8'))
+    json_data = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+    d = json.loads(json_data)
     dhcp = 'true' if d.get('dhcp_enabled', False) else 'false'
     dns  = 'true' if d.get('dns_enabled',  False) else 'false'
     print(dhcp + ' ' + dns)
@@ -3558,7 +3547,7 @@ cmd_destroy_vpc() {
 ##############################################################################
 # Command: apply-network-acl
 # Applies VPC network ACL rules to the FORWARD chain inside the namespace.
-# Rules are passed as a Base64-encoded JSON array in payload.acl_rules.
+# Rules are passed as a JSON array in payload.acl_rules.
 # Each rule has:
 #   number, action (allow|deny), trafficType (ingress|egress),
 #   protocol, portStart, portEnd, icmpType, icmpCode, sourceCidrs[]
@@ -3598,7 +3587,7 @@ cmd_apply_network_acl() {
     # ---- 4. Build iptables ACL rules via Python ----
     python3 - "${NAMESPACE}" "${acl_rules_file}" "${veth_n}" \
               "${acl_chain_name}" "${CIDR:-}" << 'PYEOF'
-import base64, json, subprocess, sys
+import json, subprocess, sys
 
 namespace    = sys.argv[1]
 rules_file   = sys.argv[2]
@@ -3608,7 +3597,7 @@ net_cidr     = sys.argv[5]   # tier CIDR (may be empty)
 
 try:
     with open(rules_file, 'r', encoding='utf-8') as f:
-        rules_b64 = f.read().strip()
+        rules_json = f.read().strip()
 except Exception as e:
     print(f"apply-network-acl: failed to read rules file: {e}", file=sys.stderr)
     sys.exit(1)
@@ -3623,11 +3612,11 @@ def _run(table, *args):
 def iptf(*args):
     _run('filter', *args)
 
-if rules_b64:
+if rules_json:
     try:
-        rules = json.loads(base64.b64decode(rules_b64).decode('utf-8'))
+        rules = json.loads(rules_json)
     except Exception as e:
-        print(f"apply-network-acl: failed to decode rules: {e}", file=sys.stderr)
+        print(f"apply-network-acl: failed to parse rules: {e}", file=sys.stderr)
         sys.exit(1)
 else:
     rules = []
