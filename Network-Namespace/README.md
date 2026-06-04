@@ -818,7 +818,7 @@ network operations).
 ```
 network-namespace-wrapper.sh implement-vpc \
     --vpc-id <vpc-id> \
-    [--cidr <vpc-cidr>] \
+    [--vpc-cidr <vpc-cidr>] \
     [--public-ip <ip>] [--public-vlan <pvlan>] \
     [--public-gateway <gw>] [--public-cidr <cidr>] \
     [--source-nat true|false]
@@ -828,7 +828,7 @@ Actions:
 1. Create the shared VPC namespace `cs-vpc-<vpc-id>` (idempotent).
 2. Disable IPv6 and enable IP forwarding inside the namespace.
 3. Optionally, when `--source-nat true`, `--public-ip`, and `--public-vlan` are all
-   provided and `--cidr` (VPC CIDR) is given:
+   provided and `--vpc-cidr` (VPC CIDR) is given:
    * Create public veth pair `vph-<pvlan>-<vpc-id>` (host) / `vpn-<pvlan>-<vpc-id>` (namespace).
    * Assign `<public-ip>` to `vpn-<pvlan>-<vpc-id>` inside the namespace.
    * Set namespace default route via `--public-gateway` (if given).
@@ -846,7 +846,7 @@ Actions:
 network-namespace-wrapper.sh update-vpc-source-nat-ip \
     --vpc-id <vpc-id> \
     --public-ip <new-source-nat-ip> \
-    [--cidr <vpc-cidr>] \
+    [--vpc-cidr <vpc-cidr>] \
     [--public-vlan <pvlan>] \
     [--public-gateway <gw>] \
     [--public-cidr <cidr>] \

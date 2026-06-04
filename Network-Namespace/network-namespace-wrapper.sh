@@ -3367,7 +3367,7 @@ parse_vpc_args() {
 
     VPC_ID=$(_payload_json_get "${payload_file}" "payload.vpc_id")
     NAMESPACE=$(_payload_json_get "${payload_file}" "payload.namespace")
-    VPC_CIDR=$(_payload_json_get "${payload_file}" "payload.cidr")
+    VPC_CIDR=$(_payload_json_get "${payload_file}" "payload.vpc_cidr")
     PUBLIC_IP=$(_payload_json_get "${payload_file}" "payload.public_ip")
     PUBLIC_VLAN=$(_payload_json_get "${payload_file}" "payload.public_vlan")
     PUBLIC_GATEWAY=$(_payload_json_get "${payload_file}" "payload.public_gateway")
@@ -3517,7 +3517,7 @@ cmd_update_vpc_source_nat_ip() {
         PUBLIC_VLAN=$(cat "${vsd}/ips/${PUBLIC_IP}.pvlan" 2>/dev/null || true)
     fi
 
-    [ -z "${VPC_CIDR}" ]   && die "update-vpc-source-nat-ip: missing --cidr (or persisted vpc cidr)"
+    [ -z "${VPC_CIDR}" ]   && die "update-vpc-source-nat-ip: missing --vpc-cidr (or persisted vpc cidr)"
     [ -z "${PUBLIC_VLAN}" ] && die "update-vpc-source-nat-ip: missing --public-vlan"
 
     log "update-vpc-source-nat-ip: vpc=${VPC_ID} ns=${NAMESPACE} old=? new=${PUBLIC_IP} pvlan=${PUBLIC_VLAN} cidr=${VPC_CIDR}"
