@@ -1478,13 +1478,50 @@ name bridges as `br<eth>-<vlan>` and veth pairs as `vh-<vlan>-<id>` /
 
 ### Common keys inside `payload` (standard commands)
 
-| `payload` key | Commands | Description |
-|--------------|----------|-------------|
-| `vpc_id` | many | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
-| `public_vlan` | `assign-ip`, `release-ip` | Public IP VLAN tag (for example `101`) |
-| `network_id` | most | Network ID — CHOSEN_ID for veth names is `<vpc_id>` when VPC, else `<network_id>` |
-| `extension_ip` | `implement-network`, `config-dhcp-subnet`, `config-dns-subnet`, `restore-network` | Dedicated IP for DHCP/DNS/metadata service when it differs from the gateway |
-| `current_details` | `ensure-network-device` | Previous selected-device JSON, used to preserve host affinity |
+#### Network-level fields
+
+| `payload` key | Description |
+|--------------|-------------|
+| `network_id` | Network ID — `CHOSEN_ID` for veth names is `<vpc_id>` when VPC, else `<network_id>` |
+| `vlan` | Guest VLAN tag |
+| `zone_id` | CloudStack zone ID |
+| `guest_type` | Guest network type: `"isolated"`, `"shared"`, or `"l2"`. The wrapper uses this to skip iptables / NAT / public-veth operations for `shared` networks. |
+| `gateway` | Guest network gateway |
+| `cidr` | Guest network CIDR |
+| `vpc_id` | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
+| `network_ip6_gateway` | Guest IPv6 gateway, when configured |
+| `network_ip6_cidr` | Guest IPv6 CIDR, when configured |
+| `extension_ip` | IP for DHCP/DNS/metadata service — equals gateway when SourceNat/Gateway is active, otherwise a dedicated placeholder IP |
+| `dns` | Comma-separated DNS server list |
+| `domain` | Network domain suffix |
+| `current_details` | `ensure-network-device` only — previous selected-device JSON, used to preserve host affinity |
+
+#### NIC-level fields
+
+| `payload` key | Description |
+|--------------|-------------|
+| `nic_id` | CloudStack numeric NIC ID |
+| `nic_uuid` | NIC UUID — matches `external_ids:iface-id` written by the KVM agent |
+| `mac` | VM NIC MAC address |
+| `ip` | VM NIC IPv4 address |
+| `gateway` | VM NIC IPv4 gateway |
+| `netmask` | VM NIC IPv4 netmask |
+| `default_nic` | `"false"` for secondary NICs (gateway DHCP option suppressed) |
+| `device_id` | NIC device slot index |
+| `nic_ip6_address` | VM NIC IPv6 address, when configured |
+| `nic_ip6_gateway` | VM NIC IPv6 gateway, when available |
+| `nic_ip6_cidr` | VM NIC IPv6 CIDR, when available |
+
+#### Public-IP fields
+
+| `payload` key | Description |
+|--------------|-------------|
+| `public_ip` | Public IP address |
+| `public_vlan` | Public IP VLAN tag |
+| `public_gateway` | Gateway of the public IP segment |
+| `public_cidr` | CIDR of the public IP |
+| `source_nat` | `"true"` when this IP is the source-NAT IP |
+| `private_ip` | VM private IP (NAT target) |
 
 ### Action parameters (custom-action only)
 

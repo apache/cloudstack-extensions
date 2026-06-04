@@ -467,6 +467,7 @@ parse_args() {
 
     NETWORK_ID=$(_payload_json_get "${payload_file}" "payload.network_id")
     GUEST_TYPE=$(_payload_json_get "${payload_file}" "payload.guest_type")
+    ZONE_ID=$(_payload_json_get "${payload_file}" "payload.zone_id")
     VPC_ID=$(_payload_json_get "${payload_file}" "payload.vpc_id")
     VLAN=$(_payload_json_get "${payload_file}" "payload.vlan")
     GATEWAY=$(_payload_json_get "${payload_file}" "payload.gateway")
@@ -484,6 +485,9 @@ parse_args() {
     HOSTNAME=$(_payload_json_get "${payload_file}" "payload.hostname")
     DNS_SERVER=$(_payload_json_get "${payload_file}" "payload.dns")
     NIC_ID=$(_payload_json_get "${payload_file}" "payload.nic_id")
+    NIC_UUID=$(_payload_json_get "${payload_file}" "payload.nic_uuid")
+    NETMASK=$(_payload_json_get "${payload_file}" "payload.netmask")
+    DEVICE_ID=$(_payload_json_get "${payload_file}" "payload.device_id")
     VM_IP=$(_payload_json_get "${payload_file}" "payload.ip")
     USERDATA=$(_payload_json_get "${payload_file}" "payload.userdata")
     PASSWORD=$(_payload_json_get "${payload_file}" "payload.password")

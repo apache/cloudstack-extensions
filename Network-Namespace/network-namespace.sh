@@ -340,7 +340,7 @@ if [ "${COMMAND}" = "ensure-network-device" ]; then
 
     # Namespace names must match those used by the wrapper on the KVM host.
     # VPC networks share one namespace per VPC (cs-vpc-<vpcId>);
-    # standalone isolated networks get their own namespace (cs-net-<networkId>).
+    # standalone networks (Isolated and Shared) each get their own namespace (cs-net-<networkId>).
     if [ -n "${VPC_ID}" ]; then
         NAMESPACE="cs-vpc-${VPC_ID}"
     else
