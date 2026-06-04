@@ -466,7 +466,7 @@ parse_args() {
     local payload_file="$1"
 
     NETWORK_ID=$(_payload_json_get "${payload_file}" "payload.network_id")
-    NAMESPACE=$(_payload_json_get "${payload_file}" "payload.namespace")
+    GUEST_TYPE=$(_payload_json_get "${payload_file}" "payload.guest_type")
     VPC_ID=$(_payload_json_get "${payload_file}" "payload.vpc_id")
     VLAN=$(_payload_json_get "${payload_file}" "payload.vlan")
     GATEWAY=$(_payload_json_get "${payload_file}" "payload.gateway")
@@ -505,14 +505,12 @@ parse_args() {
     [ -z "${NETWORK_ID}" ] && die "Missing --network-id"
 
     # Namespace: VPC → cs-vpc-<vpcId>; standalone → cs-net-<networkId>
-    if [ -z "${NAMESPACE}" ]; then
-        if [ -n "${VPC_ID}" ]; then
-            NAMESPACE="cs-vpc-${VPC_ID}"
-        else
-            local NS_FROM_DETAILS
-            NS_FROM_DETAILS=$(_json_get "${EXTENSION_DETAILS}" "namespace")
-            NAMESPACE="${NS_FROM_DETAILS:-cs-net-${NETWORK_ID}}"
-        fi
+    if [ -n "${VPC_ID}" ]; then
+        NAMESPACE="cs-vpc-${VPC_ID}"
+    else
+        local NS_FROM_DETAILS
+        NS_FROM_DETAILS=$(_json_get "${EXTENSION_DETAILS}" "namespace")
+        NAMESPACE="${NS_FROM_DETAILS:-cs-net-${NETWORK_ID}}"
     fi
 
     # CHOSEN_ID selects vpc-id when present, otherwise network-id
@@ -661,27 +659,29 @@ cmd_implement_network() {
     # from appearing on the interface (idempotent)
     ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".disable_ipv6=1 >/dev/null 2>&1 || true
 
-    # ---- 5. IP forwarding ----
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    if [ "${GUEST_TYPE}" = "isolated" ]; then
+         # ---- 5. IP forwarding  (needed for Isolated networks only) ----
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
-    # ---- 6. iptables chains ----
-    ensure_chain nat    "${nchain_pr}"
-    ensure_chain nat    "${nchain_post}"
-    ensure_chain filter "${fchain}"
-    ensure_jump  nat    PREROUTING  "${nchain_pr}"
-    ensure_jump  nat    POSTROUTING "${nchain_post}"
-    ensure_jump  filter FORWARD     "${fchain}"
+        # ---- 6. iptables chains  (needed for Isolated networks only) ----
+        ensure_chain nat    "${nchain_pr}"
+        ensure_chain nat    "${nchain_post}"
+        ensure_chain filter "${fchain}"
+        ensure_jump  nat    PREROUTING  "${nchain_pr}"
+        ensure_jump  nat    POSTROUTING "${nchain_post}"
+        ensure_jump  filter FORWARD     "${fchain}"
 
-    # Allow forwarding for guest traffic in/out of veth-ns-<vlan>
-    ip netns exec "${NAMESPACE}" iptables -t filter \
-        -C "${fchain}" -i "${veth_n}" -j ACCEPT 2>/dev/null || \
-    ip netns exec "${NAMESPACE}" iptables -t filter \
-        -A "${fchain}" -i "${veth_n}" -j ACCEPT
+        # Allow forwarding for guest traffic in/out of veth-ns-<vlan>
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -C "${fchain}" -i "${veth_n}" -j ACCEPT 2>/dev/null || \
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -A "${fchain}" -i "${veth_n}" -j ACCEPT
 
-    ip netns exec "${NAMESPACE}" iptables -t filter \
-        -C "${fchain}" -o "${veth_n}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    ip netns exec "${NAMESPACE}" iptables -t filter \
-        -A "${fchain}" -o "${veth_n}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -C "${fchain}" -o "${veth_n}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -A "${fchain}" -o "${veth_n}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
 
     # ---- 7. Persist state ----
     # Per-network state → network-<networkId>/
@@ -719,47 +719,54 @@ cmd_shutdown_network() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    log "shutdown-network: network=${NETWORK_ID} ns=${NAMESPACE} vpc=${VPC_ID}"
+    log "shutdown-network: network=${NETWORK_ID} ns=${NAMESPACE} guest_type=${GUEST_TYPE} vpc=${VPC_ID}"
 
-    local nchain_pr nchain_post fchain
-    nchain_pr="${CHAIN_PREFIX}_${NETWORK_ID}_PR"
-    nchain_post="${CHAIN_PREFIX}_${NETWORK_ID}_POST"
-    fchain=$(filter_chain "${NETWORK_ID}")
+    # iptables NAT/FILTER chains only exist for non-Shared networks (Shared
+    # networks have no routing/NAT role; chains are never created for them).
+    if [ "${GUEST_TYPE}" = "isolated" ]; then
+        local nchain_pr nchain_post fchain
+        nchain_pr="${CHAIN_PREFIX}_${NETWORK_ID}_PR"
+        nchain_post="${CHAIN_PREFIX}_${NETWORK_ID}_POST"
+        fchain=$(filter_chain "${NETWORK_ID}")
 
-    # Remove iptables chain jumps for this network
-    ip netns exec "${NAMESPACE}" iptables -t nat    -D PREROUTING  -j "${nchain_pr}"   2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t nat    -D POSTROUTING -j "${nchain_post}" 2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t filter -D FORWARD     -j "${fchain}"      2>/dev/null || true
+        # Remove iptables chain jumps for this network
+        ip netns exec "${NAMESPACE}" iptables -t nat    -D PREROUTING  -j "${nchain_pr}"   2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t nat    -D POSTROUTING -j "${nchain_post}" 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t filter -D FORWARD     -j "${fchain}"      2>/dev/null || true
 
-    # Flush and delete this network's chains
-    ip netns exec "${NAMESPACE}" iptables -t nat    -F "${nchain_pr}"   2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t nat    -X "${nchain_pr}"   2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t nat    -F "${nchain_post}" 2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t nat    -X "${nchain_post}" 2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t filter -F "${fchain}"      2>/dev/null || true
-    ip netns exec "${NAMESPACE}" iptables -t filter -X "${fchain}"      2>/dev/null || true
+        # Flush and delete this network's chains
+        ip netns exec "${NAMESPACE}" iptables -t nat    -F "${nchain_pr}"   2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t nat    -X "${nchain_pr}"   2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t nat    -F "${nchain_post}" 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t nat    -X "${nchain_post}" 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t filter -F "${fchain}"      2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t filter -X "${fchain}"      2>/dev/null || true
+    fi
 
-    # Remove public veth pairs owned by THIS tier only (guarded by .tier file).
-    # IPs owned by other tiers are left untouched so those tiers keep working.
-    # Backward compat: if no .tier file exists assume the IP belongs here.
+    # Public veth pairs and NAT state only exist for non-Shared networks.
     local vsd; vsd=$(_vpc_state_dir)
-    if [ -d "${vsd}/ips" ]; then
-        for f in "${vsd}/ips/"*.pvlan; do
-            [ -f "${f}" ] || continue
-            local tier_f; tier_f="${f%.pvlan}.tier"
-            if [ -f "${tier_f}" ]; then
-                local owner_tier; owner_tier=$(cat "${tier_f}" 2>/dev/null || true)
-                if [ -n "${owner_tier}" ] && [ "${owner_tier}" != "${NETWORK_ID}" ]; then
-                    log "shutdown-network: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
-                    continue
+    if [ "${GUEST_TYPE}" = "isolated" ]; then
+        # Remove public veth pairs owned by THIS tier only (guarded by .tier file).
+        # IPs owned by other tiers are left untouched so those tiers keep working.
+        # Backward compat: if no .tier file exists assume the IP belongs here.
+        if [ -d "${vsd}/ips" ]; then
+            for f in "${vsd}/ips/"*.pvlan; do
+                [ -f "${f}" ] || continue
+                local tier_f; tier_f="${f%.pvlan}.tier"
+                if [ -f "${tier_f}" ]; then
+                    local owner_tier; owner_tier=$(cat "${tier_f}" 2>/dev/null || true)
+                    if [ -n "${owner_tier}" ] && [ "${owner_tier}" != "${NETWORK_ID}" ]; then
+                        log "shutdown-network: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
+                        continue
+                    fi
                 fi
-            fi
-            local pvlan pveth_h
-            pvlan=$(cat "${f}")
-            pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
-            ip link del "${pveth_h}" 2>/dev/null || true
-            log "shutdown-network: removed public veth ${pveth_h}"
-        done
+                local pvlan pveth_h
+                pvlan=$(cat "${f}")
+                pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
+                ip link del "${pveth_h}" 2>/dev/null || true
+                log "shutdown-network: removed public veth ${pveth_h}"
+            done
+        fi
     fi
 
     # Remove this tier's guest veth pair (host-side)
@@ -768,15 +775,16 @@ cmd_shutdown_network() {
     ip link del "${veth_h}" 2>/dev/null || true
     log "shutdown-network: removed guest veth ${veth_h}"
 
-    # Clean transient public IP state.
-    # For isolated networks the state dir is per-network, so wipe it entirely.
-    # For VPC networks the ips/ dir is shared across all tiers; only remove the
-    # per-tier rule directories so other tiers are not affected.
-    if [ -z "${VPC_ID}" ]; then
-        rm -rf "${vsd}/ips" "${vsd}/static-nat" "${vsd}/port-forward"
-    else
-        rm -rf "${STATE_DIR}/network-${NETWORK_ID}/static-nat" \
-               "${STATE_DIR}/network-${NETWORK_ID}/port-forward" 2>/dev/null || true
+    # Clean transient state directories.
+    # Shared networks have no public IP / NAT / port-forward state, so only
+    # isolated/VPC networks need this cleanup.
+    if [ "${GUEST_TYPE}" = "isolated" ]; then
+        if [ -z "${VPC_ID}" ]; then
+            rm -rf "${vsd}/ips" "${vsd}/static-nat" "${vsd}/port-forward"
+        else
+            rm -rf "${STATE_DIR}/network-${NETWORK_ID}/static-nat" \
+                   "${STATE_DIR}/network-${NETWORK_ID}/port-forward" 2>/dev/null || true
+        fi
     fi
 
     # Stop per-network services (dnsmasq, haproxy, apache2, passwd-server)
@@ -785,8 +793,9 @@ cmd_shutdown_network() {
     _svc_stop_apache2
     _svc_stop_passwd_server
 
-    # For isolated networks delete the namespace; VPC namespaces are shared
-    # across tiers and must only be deleted when the last tier is destroyed.
+    # For isolated and Shared networks delete the namespace directly.
+    # VPC namespaces are shared across tiers and must only be deleted
+    # when the last tier is destroyed (shutdown-vpc).
     if [ -z "${VPC_ID}" ]; then
         ip netns del "${NAMESPACE}" 2>/dev/null || true
         rm -rf "/etc/netns/${NAMESPACE}" 2>/dev/null || true
@@ -811,7 +820,7 @@ cmd_destroy_network() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    log "destroy-network: network=${NETWORK_ID} ns=${NAMESPACE} vpc=${VPC_ID}"
+    log "destroy-network: network=${NETWORK_ID} ns=${NAMESPACE} guest_type=${GUEST_TYPE} vpc=${VPC_ID}"
 
     # Remove this tier's guest veth host-side
     local veth_h
@@ -820,26 +829,30 @@ cmd_destroy_network() {
 
     local vsd; vsd=$(_vpc_state_dir)
 
-    # Remove public veth pairs that belong to THIS tier (guarded by .tier file).
-    # IPs owned by other tiers are left untouched so those tiers keep working.
-    # Backward compat: if no .tier file exists assume the IP belongs here.
-    if [ -d "${vsd}/ips" ]; then
-        for f in "${vsd}/ips/"*.pvlan; do
-            [ -f "${f}" ] || continue
-            local tier_f; tier_f="${f%.pvlan}.tier"
-            if [ -f "${tier_f}" ]; then
-                local owner_tier; owner_tier=$(cat "${tier_f}" 2>/dev/null || true)
-                if [ -n "${owner_tier}" ] && [ "${owner_tier}" != "${NETWORK_ID}" ]; then
-                    log "destroy-network: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
-                    continue
+    # Public veth pairs and their state files only exist for Isolated networks
+    # (Shared networks have no NAT/routing role, so no public veths are created).
+    if [ "${GUEST_TYPE}" = "isolated" ]; then
+        # Remove public veth pairs that belong to THIS tier (guarded by .tier file).
+        # IPs owned by other tiers are left untouched so those tiers keep working.
+        # Backward compat: if no .tier file exists assume the IP belongs here.
+        if [ -d "${vsd}/ips" ]; then
+            for f in "${vsd}/ips/"*.pvlan; do
+                [ -f "${f}" ] || continue
+                local tier_f; tier_f="${f%.pvlan}.tier"
+                if [ -f "${tier_f}" ]; then
+                    local owner_tier; owner_tier=$(cat "${tier_f}" 2>/dev/null || true)
+                    if [ -n "${owner_tier}" ] && [ "${owner_tier}" != "${NETWORK_ID}" ]; then
+                        log "destroy-network: skipping veth for $(basename "${f%.pvlan}") (owned by tier ${owner_tier})"
+                        continue
+                    fi
                 fi
-            fi
-            local pvlan pveth_h
-            pvlan=$(cat "${f}")
-            pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
-            ip link del "${pveth_h}" 2>/dev/null || true
-            rm -f "${f}" "${f%.pvlan}" "${tier_f}" 2>/dev/null || true
-        done
+                local pvlan pveth_h
+                pvlan=$(cat "${f}")
+                pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
+                ip link del "${pveth_h}" 2>/dev/null || true
+                rm -f "${f}" "${f%.pvlan}" "${tier_f}" 2>/dev/null || true
+            done
+        fi
     fi
 
     # Stop per-network services before removing state
@@ -851,13 +864,14 @@ cmd_destroy_network() {
     # Remove this network's per-tier state directory
     rm -rf "$(_net_state_dir)"
 
-    # Deregister this tier from VPC tracking
+    # Deregister this tier from VPC tracking, or delete the namespace for
+    # standalone networks (Isolated and Shared each own their own namespace).
     if [ -n "${VPC_ID}" ]; then
         rm -f "${vsd}/tiers/${NETWORK_ID}" 2>/dev/null || true
         # The VPC namespace is managed by shutdown-vpc / destroy-vpc — do NOT delete it here.
         log "destroy-network: deregistered tier ${NETWORK_ID} from VPC ${VPC_ID} (namespace preserved)"
     else
-        # Isolated network: delete the namespace directly
+        # Isolated or Shared: each has its own namespace, remove it entirely.
         if ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
             ip netns del "${NAMESPACE}"
             rm -rf "/etc/netns/${NAMESPACE}" 2>/dev/null || true
@@ -2055,7 +2069,22 @@ cmd_prepare_nic() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
-    log "prepare-nic: network=${NETWORK_ID} ns=${NAMESPACE} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
+    log "prepare-nic: network=${NETWORK_ID} ns=${NAMESPACE} guest_type=${GUEST_TYPE} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
+
+    # ---- Shared network: lazily implement on first NIC attach ----
+    # For Shared networks implement-network is not called at deploy time
+    # (no dedicated gateway / no NAT), so the namespace + bridge + veth
+    # must be created here the first time a VM NIC is attached.
+    if [ "${GUEST_TYPE}" = "shared" ]; then
+        local nsd; nsd=$(_net_state_dir)
+        if [ ! -f "${nsd}/vlan" ]; then
+            log "prepare-nic: shared network — running implement-network for network=${NETWORK_ID}"
+            release_lock
+            cmd_implement_network "$@"
+            acquire_lock "${NETWORK_ID}"
+            _load_state
+        fi
+    fi
 
     local dnsmasq_reloaded="false"
 
@@ -3366,7 +3395,6 @@ parse_vpc_args() {
     local payload_file="$1"
 
     VPC_ID=$(_payload_json_get "${payload_file}" "payload.vpc_id")
-    NAMESPACE=$(_payload_json_get "${payload_file}" "payload.namespace")
     VPC_CIDR=$(_payload_json_get "${payload_file}" "payload.vpc_cidr")
     PUBLIC_IP=$(_payload_json_get "${payload_file}" "payload.public_ip")
     PUBLIC_VLAN=$(_payload_json_get "${payload_file}" "payload.public_vlan")
@@ -3378,11 +3406,9 @@ parse_vpc_args() {
 
     [ -z "${VPC_ID}" ] && die "Missing payload.vpc_id"
 
-    if [ -z "${NAMESPACE}" ]; then
-        local NS_FROM_DETAILS
-        NS_FROM_DETAILS=$(_json_get "${EXTENSION_DETAILS}" "namespace")
-        NAMESPACE="${NS_FROM_DETAILS:-cs-vpc-${VPC_ID}}"
-    fi
+    local NS_FROM_DETAILS
+    NS_FROM_DETAILS=$(_json_get "${EXTENSION_DETAILS}" "namespace")
+    NAMESPACE="${NS_FROM_DETAILS:-cs-vpc-${VPC_ID}}"
 
     # Normalise VLANs
     if [ -n "${PUBLIC_VLAN}" ]; then
