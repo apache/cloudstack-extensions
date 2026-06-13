@@ -386,8 +386,19 @@ cmk updateRegisteredExtension \
     "details[1].key=username"              "details[1].value=root" \
     "details[2].key=sshkey"                "details[2].value=<pem-key-contents>" \
     "details[3].key=guest.network.device"  "details[3].value=eth1" \
-    "details[4].key=public.network.device" "details[4].value=eth1"
+    "details[4].key=public.network.device" "details[4].value=eth1" \
+    "details[5].key=isolation_method"      "details[5].value=NetworkExtension"
 ```
+
+> **`isolation_method=NetworkExtension`** causes CloudStack to use
+> `NetworkExtensionGuestNetworkGuru` when designing guest networks backed by
+> this extension.  The network-namespace extension uses VLAN-based isolation
+> and does not rely on the script output from `implement-network` to override
+> the broadcast domain type, so this detail is not strictly required for basic
+> operation.  It is included here as best practice and for forward
+> compatibility — extensions that return `network.broadcast_domain_type` or
+> `network.broadcast_uri` from `implement-network` **must** set it or those
+> updates will be silently ignored by CloudStack.
 
 The `hosts` value is a comma-separated list of KVM host IPs; `ensure-network-device`
 picks one per network and stores it in `--network-extension-details`.  Use `sshkey`
@@ -1486,6 +1497,7 @@ name bridges as `br<eth>-<vlan>` and veth pairs as `vh-<vlan>-<id>` /
 | `vlan` | Guest VLAN tag |
 | `zone_id` | CloudStack zone ID |
 | `guest_type` | Guest network type: `"isolated"`, `"shared"`, or `"l2"`. The wrapper uses this to skip iptables / NAT / public-veth operations for `shared` networks. |
+| `network_state` | Guest network state: `"allocated"`, `"setup"`, `"implementing"`, `"implemented"`, `"shutdown"` or `"destroy"`. |
 | `gateway` | Guest network gateway |
 | `cidr` | Guest network CIDR |
 | `vpc_id` | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
@@ -1508,9 +1520,9 @@ name bridges as `br<eth>-<vlan>` and veth pairs as `vh-<vlan>-<id>` /
 | `netmask` | VM NIC IPv4 netmask |
 | `default_nic` | `"false"` for secondary NICs (gateway DHCP option suppressed) |
 | `device_id` | NIC device slot index |
-| `nic_ip6_address` | VM NIC IPv6 address, when configured |
-| `nic_ip6_gateway` | VM NIC IPv6 gateway, when available |
-| `nic_ip6_cidr` | VM NIC IPv6 CIDR, when available |
+| `ip6_address` | VM NIC IPv6 address, when configured |
+| `ip6_gateway` | VM NIC IPv6 gateway, when available |
+| `ip6_cidr` | VM NIC IPv6 CIDR, when available |
 
 #### Public-IP fields
 

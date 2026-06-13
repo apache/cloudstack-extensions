@@ -423,15 +423,27 @@ ensure_host_bridge() {
 
     # VLAN sub-interface
     if ! ip link show "${vif}" >/dev/null 2>&1; then
-        ip link add link "${eth}" name "${vif}" type vlan id "${vlan}"
+        if ! ip link add link "${eth}" name "${vif}" type vlan id "${vlan}" 2>/dev/null; then
+            if [ "${NETWORK_STATE:-}" = "shutdown" ]; then
+                log "ensure_host_bridge: failed to create ${vif} (network_state=shutdown, ignoring)"
+                echo "${br}"; return 0
+            fi
+            ip link add link "${eth}" name "${vif}" type vlan id "${vlan}"
+        fi
         log "Created VLAN interface ${vif}"
     fi
     ip link set "${vif}" up 2>/dev/null || true
 
     # Bridge
     if ! ip link show "${br}" >/dev/null 2>&1; then
-        ip link add name "${br}" type bridge
-        ip link set "${br}" up
+        if ! ip link add name "${br}" type bridge 2>/dev/null; then
+            if [ "${NETWORK_STATE:-}" = "shutdown" ]; then
+                log "ensure_host_bridge: failed to create ${br} (network_state=shutdown, ignoring)"
+                echo "${br}"; return 0
+            fi
+            ip link add name "${br}" type bridge
+        fi
+        ip link set "${br}" up 2>/dev/null || true
         log "Created host bridge ${br}"
     fi
 
@@ -442,6 +454,18 @@ ensure_host_bridge() {
     fi
 
     echo "${br}"
+}
+
+# _guard_ns_shutdown <caller-label>
+# When network_state is "shutdown" and the namespace is already gone, exit
+# successfully — the network has already been torn down on this host.
+# Call this after acquire_lock in any command that does namespace operations.
+_guard_ns_shutdown() {
+    [ "${NETWORK_STATE:-}" = "shutdown" ] || return 0
+    ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b" && return 0
+    log "${1:-command}: namespace ${NAMESPACE} not found (network_state=shutdown) — treating as success"
+    release_lock
+    exit 0
 }
 
 ensure_chain() {
@@ -501,6 +525,7 @@ parse_args() {
     RESTORE_DATA=$(_payload_json_get "${payload_file}" "payload.restore_data")
     FW_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.fw_rules")
     ACL_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.acl_rules")
+    NETWORK_STATE=$(_payload_json_get "${payload_file}" "payload.network_state")
 
     [ -z "${SOURCE_NAT}" ] && SOURCE_NAT="false"
     [ -z "${LB_RULES_JSON}" ] && LB_RULES_JSON="[]"
@@ -899,6 +924,7 @@ cmd_assign_ip() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
+    _guard_ns_shutdown "assign-ip"
     log "assign-ip: network=${NETWORK_ID} ns=${NAMESPACE} ip=${PUBLIC_IP} source_nat=${SOURCE_NAT}"
     [ -z "${PUBLIC_IP}" ]   && die "Missing --public-ip"
     [ -z "${PUBLIC_VLAN}" ] && die "Missing --public-vlan"
@@ -1091,6 +1117,7 @@ cmd_add_static_nat() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
+    _guard_ns_shutdown "add-static-nat"
     log "add-static-nat: network=${NETWORK_ID} ns=${NAMESPACE} ${PUBLIC_IP} <-> ${PRIVATE_IP}"
     [ -z "${PUBLIC_IP}" ]  && die "Missing --public-ip"
     [ -z "${PRIVATE_IP}" ] && die "Missing --private-ip"
@@ -1198,6 +1225,7 @@ cmd_add_port_forward() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
+    _guard_ns_shutdown "add-port-forward"
     log "add-port-forward: network=${NETWORK_ID} ns=${NAMESPACE} ${PUBLIC_IP}:${PUBLIC_PORT} -> ${PRIVATE_IP}:${PRIVATE_PORT} (${PROTOCOL})"
     [ -z "${PUBLIC_IP}" ]    && die "Missing --public-ip"
     [ -z "${PUBLIC_PORT}" ]  && die "Missing --public-port"
@@ -1687,7 +1715,8 @@ _svc_start_or_reload_apache2() {
     fi
 
     # Allow metadata traffic inbound to the namespace (INPUT) from guest subnet only.
-    if [ -n "${CIDR}" ]; then
+    # Skip if namespace is gone (e.g. network already shut down).
+    if [ -n "${CIDR}" ] && ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
         ip netns exec "${NAMESPACE}" iptables -t filter \
             -C INPUT -p tcp -s "${CIDR}" --dport 80 -j ACCEPT 2>/dev/null || \
         ip netns exec "${NAMESPACE}" iptables -t filter \
@@ -2490,6 +2519,7 @@ cmd_apply_fw_rules() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _guard_ns_shutdown "apply-fw-rules"
     log "apply-fw-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     local fw_rules_file=""
@@ -3702,6 +3732,7 @@ cmd_apply_network_acl() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _guard_ns_shutdown "apply-network-acl"
     log "apply-network-acl: network=${NETWORK_ID} ns=${NAMESPACE} cidr=${CIDR}"
 
     local acl_rules_file=""
