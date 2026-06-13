@@ -3030,16 +3030,16 @@ if action == "pbr-list-tables":
             data.append({"id": parts[0], "name": parts[1]})
         else:
             data.append({"result": row})
-    print(json.dumps({"status": "success", "message": data}))
+    print(json.dumps({"status": "success", "printmessage": "true", "message": data}))
 elif action == "pbr-list-routes":
     data = [{"route": row} for row in rows]
-    print(json.dumps({"status": "success", "message": data}))
+    print(json.dumps({"status": "success", "printmessage": "true", "message": data}))
 elif action == "pbr-list-rules":
     data = [{"rule": row} for row in rows]
-    print(json.dumps({"status": "success", "message": data}))
+    print(json.dumps({"status": "success", "printmessage": "true", "message": data}))
 else:
     msg = rows[0] if rows else f"{action}: OK"
-    print(json.dumps({"status": "success", "message": msg}))
+    print(json.dumps({"status": "success", "printmessage": "true", "message": msg}))
 PYEOF
 }
 
