@@ -386,13 +386,12 @@ cmk updateRegisteredExtension \
     "details[1].key=username"              "details[1].value=root" \
     "details[2].key=sshkey"                "details[2].value=<pem-key-contents>" \
     "details[3].key=guest.network.device"  "details[3].value=eth1" \
-    "details[4].key=public.network.device" "details[4].value=eth1" \
-    "details[5].key=isolation_method"      "details[5].value=NetworkExtension"
+    "details[4].key=public.network.device" "details[4].value=eth1"
 ```
 
-> **`isolation_method=NetworkExtension`** causes CloudStack to use
-> `NetworkExtensionGuestNetworkGuru` when designing guest networks backed by
-> this extension.  The network-namespace extension uses VLAN-based isolation
+> **`network.isolation.method=NetworkExtension`** must be set as an Extension
+> detail (via `createExtension` or `updateExtension`), not as a physical-network
+> registration detail.  The network-namespace extension uses VLAN-based isolation
 > and does not rely on the script output from `implement-network` to override
 > the broadcast domain type, so this detail is not strictly required for basic
 > operation.  It is included here as best practice and for forward
