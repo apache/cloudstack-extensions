@@ -306,9 +306,9 @@ All examples below use `cmk` (the CloudStack CLI).  Replace `<zone-uuid>`,
 cmk createExtension \
     name=my-extnet \
     type=NetworkOrchestrator \
-    path=network-namespace \
-    details[0]."network.services"="SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
-    details[1]."network.service.capabilities"="{\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per public ip\"}}"
+    path=network-namespace/network-namespace.sh \
+    details[0].network.services="Vpn,Dhcp,Dns,SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
+    details[1].network.service.capabilities={\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per\ public\ ip\"}}
 ```
 
 The two details declare which services this extension provides and their
