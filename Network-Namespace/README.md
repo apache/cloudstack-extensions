@@ -307,8 +307,8 @@ cmk createExtension \
     name=my-extnet \
     type=NetworkOrchestrator \
     path=network-namespace \
-    details[0]."network.services"="SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
-    details[1]."network.service.capabilities"="{\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per public ip\"}}"
+    details[0].network.services="SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
+    details[1].network.service.capabilities="{\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per public ip\"}}"
 ```
 
 The two details declare which services this extension provides and their
@@ -380,11 +380,11 @@ cmk updateRegisteredExtension \
     extensionid=<extension-uuid> \
     resourcetype=PhysicalNetwork \
     resourceid=<phys-net-uuid> \
-    "details[0].key=hosts"                 "details[0].value=192.168.10.1,192.168.10.2" \
-    "details[1].key=username"              "details[1].value=root" \
-    "details[2].key=sshkey"                "details[2].value=<pem-key-contents>" \
-    "details[3].key=guest.network.device"  "details[3].value=eth1" \
-    "details[4].key=public.network.device" "details[4].value=eth1"
+    "details[0].hosts=192.168.10.1,192.168.10.2" \
+    "details[1].username=root" \
+    "details[2].sshkey=<pem-key-contents>" \
+    "details[3].guest.network.device=eth1" \
+    "details[4].public.network.device=eth1"
 ```
 
 > **`network.isolation.method=NetworkExtension`** must be set as an Extension
@@ -700,9 +700,9 @@ cmk updateRegisteredExtension \
     extensionid=<ext-a-uuid> \
     resourcetype=PhysicalNetwork \
     resourceid=<pn-uuid> \
-    "details[0].key=hosts"                 "details[0].value=10.0.0.1,10.0.0.2" \
-    "details[1].key=guest.network.device"  "details[1].value=eth1" \
-    "details[2].key=public.network.device" "details[2].value=eth1"
+    "details[0].hosts=10.0.0.1,10.0.0.2" \
+    "details[1].guest.network.device=eth1" \
+    "details[2].public.network.device=eth1"
 ```
 
 When creating network offerings, reference the specific extension name:

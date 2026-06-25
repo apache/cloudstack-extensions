@@ -2549,13 +2549,14 @@ cmd_apply_fw_rules() {
 
     # ---- 4. Build iptables rules via Python ----
     python3 - "${NAMESPACE}" "${fw_rules_file}" "${veth_n}" \
-              "${fw_chain}" << 'PYEOF'
-import json, re, subprocess, sys
+              "${fw_chain}" "$(_vpc_state_dir)" << 'PYEOF'
+import json, os, re, subprocess, sys
 
 namespace = sys.argv[1]
 rules_file = sys.argv[2]
 veth_n    = sys.argv[3]
 fw_chain  = sys.argv[4]   # filter table egress chain (CS_EXTNET_FWRULES_<N>)
+state_dir = sys.argv[5]   # vpc-or-network state directory for static-nat entries
 
 try:
     with open(rules_file, 'r', encoding='utf-8') as f:
@@ -2733,11 +2734,32 @@ for pub_ip, ip_rules in pub_ip_rules.items():
     # Default: drop new connections not matched by any explicit rule above.
     iptm('-A', chain_name, '-j', 'DROP')
 
+# Step 3: create default-DROP chains for static-NAT IPs that have no ingress
+# rules in this invocation.  Without this, removing all firewall rules for a
+# static-NAT IP leaves no mangle chain for that IP, so inbound traffic is never
+# filtered and the VM remains reachable despite having no allowed firewall rules.
+static_nat_dir = os.path.join(state_dir, 'static-nat')
+n_protected = 0
+if os.path.isdir(static_nat_dir):
+    for fn in os.listdir(static_nat_dir):
+        if not re.match(r'^\d+\.\d+\.\d+\.\d+$', fn):
+            continue
+        pub_ip = fn
+        if pub_ip in pub_ip_rules:
+            continue  # already has an explicit chain built above
+        chain_name = FW_INGRESS_PREFIX + pub_ip
+        iptm('-N', chain_name)
+        iptm('-A', 'PREROUTING', '-d', f'{pub_ip}/32', '-j', chain_name)
+        iptm('-A', chain_name, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
+        iptm('-A', chain_name, '-j', 'DROP')
+        n_protected += 1
+
 n_in  = sum(len(v) for v in pub_ip_rules.values())
 n_eg  = len(egress_rules)
 policy = 'ALLOW' if default_egress_allow else 'DENY'
 print(f"apply-fw-rules: built {n_in} ingress rule(s) across {len(pub_ip_rules)} public IP(s), "
-      f"{n_eg} egress rule(s), default_egress={policy}")
+      f"{n_eg} egress rule(s), default_egress={policy}, "
+      f"default-DROP chains for {n_protected} static-NAT IP(s) with no rules")
 PYEOF
 
     local py_exit=$?
