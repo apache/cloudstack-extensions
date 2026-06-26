@@ -456,14 +456,18 @@ ensure_host_bridge() {
     echo "${br}"
 }
 
-# _guard_ns_shutdown <caller-label>
-# When network_state is "shutdown" and the namespace is already gone, exit
-# successfully — the network has already been torn down on this host.
+# _guard_ns_teardown <caller-label>
+# When network_state is "shutdown", "destroy", or "allocated" and the namespace
+# is already gone, exit successfully — the network has been torn down or was
+# never implemented on this host.
 # Call this after acquire_lock in any command that does namespace operations.
-_guard_ns_shutdown() {
-    [ "${NETWORK_STATE:-}" = "shutdown" ] || return 0
+_guard_ns_teardown() {
+    case "${NETWORK_STATE:-}" in
+        shutdown|destroy|allocated) ;;
+        *) return 0 ;;
+    esac
     ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b" && return 0
-    log "${1:-command}: namespace ${NAMESPACE} not found (network_state=shutdown) — treating as success"
+    log "${1:-command}: namespace ${NAMESPACE} not found (network_state=${NETWORK_STATE}) — treating as success"
     release_lock
     exit 0
 }
@@ -924,7 +928,7 @@ cmd_assign_ip() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    _guard_ns_shutdown "assign-ip"
+    _guard_ns_teardown "assign-ip"
     log "assign-ip: network=${NETWORK_ID} ns=${NAMESPACE} ip=${PUBLIC_IP} source_nat=${SOURCE_NAT}"
     [ -z "${PUBLIC_IP}" ]   && die "Missing --public-ip"
     [ -z "${PUBLIC_VLAN}" ] && die "Missing --public-vlan"
@@ -1117,7 +1121,7 @@ cmd_add_static_nat() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    _guard_ns_shutdown "add-static-nat"
+    _guard_ns_teardown "add-static-nat"
     log "add-static-nat: network=${NETWORK_ID} ns=${NAMESPACE} ${PUBLIC_IP} <-> ${PRIVATE_IP}"
     [ -z "${PUBLIC_IP}" ]  && die "Missing --public-ip"
     [ -z "${PRIVATE_IP}" ] && die "Missing --private-ip"
@@ -1225,7 +1229,7 @@ cmd_add_port_forward() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    _guard_ns_shutdown "add-port-forward"
+    _guard_ns_teardown "add-port-forward"
     log "add-port-forward: network=${NETWORK_ID} ns=${NAMESPACE} ${PUBLIC_IP}:${PUBLIC_PORT} -> ${PRIVATE_IP}:${PRIVATE_PORT} (${PROTOCOL})"
     [ -z "${PUBLIC_IP}" ]    && die "Missing --public-ip"
     [ -z "${PUBLIC_PORT}" ]  && die "Missing --public-port"
@@ -1359,8 +1363,10 @@ _passwd_server_script() { echo "$(_net_state_dir)/passwd-server.py"; }
 
 # _require_binary <binary> [<binary2> ...]
 # Checks that at least one of the given binaries is executable.
-# If none are found, calls die() with a clear error message.
-# Use when a binary is required for the current command to succeed.
+# If none are found:
+#   - network_state is shutdown/destroy/allocated → log and exit 0 (the service
+#     was never running so there is nothing to clean up).
+#   - otherwise → die() with a clear error message.
 _require_binary() {
     local bin
     for bin in "$@"; do
@@ -1368,6 +1374,12 @@ _require_binary() {
             return 0
         fi
     done
+    case "${NETWORK_STATE:-}" in
+        shutdown|destroy|allocated)
+            log "Required binary '$1' not found (network_state=${NETWORK_STATE}) — treating as success"
+            release_lock
+            exit 0 ;;
+    esac
     die "Required binary '$1' not found on this host"
 }
 
@@ -2550,7 +2562,7 @@ cmd_apply_fw_rules() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
-    _guard_ns_shutdown "apply-fw-rules"
+    _guard_ns_teardown "apply-fw-rules"
     log "apply-fw-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     local fw_rules_file=""
@@ -3789,7 +3801,7 @@ cmd_apply_network_acl() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
-    _guard_ns_shutdown "apply-network-acl"
+    _guard_ns_teardown "apply-network-acl"
     log "apply-network-acl: network=${NETWORK_ID} ns=${NAMESPACE} cidr=${CIDR}"
 
     local acl_rules_file=""
