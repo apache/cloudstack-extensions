@@ -981,7 +981,7 @@ cmd_assign_ip() {
             >/dev/null 2>&1 || true
         log "assign-ip: sent gratuitous ARP for ${PUBLIC_IP} on ${pveth_n}"
     else
-        log "assign-ip: arping not available — skipping gratuitous ARP for ${PUBLIC_IP}"
+        log "assign-ip: arping not found — skipping gratuitous ARP for ${PUBLIC_IP}"
     fi
 
     # ---- Default route inside namespace toward upstream gateway ----
@@ -1354,14 +1354,28 @@ _passwd_server_pid()    { echo "$(_net_state_dir)/passwd-server.pid"; }
 _passwd_server_script() { echo "$(_net_state_dir)/passwd-server.py"; }
 
 ##############################################################################
-# Helpers: binary detection
+# Helpers: binary detection and package checking
 ##############################################################################
 
+# _require_binary <binary> [<binary2> ...]
+# Checks that at least one of the given binaries is executable.
+# If none are found, calls die() with a clear error message.
+# Use when a binary is required for the current command to succeed.
+_require_binary() {
+    local bin
+    for bin in "$@"; do
+        if command -v "${bin}" >/dev/null 2>&1 || [ -x "${bin}" ]; then
+            return 0
+        fi
+    done
+    die "Required binary '$1' not found on this host"
+}
+
 _find_apache2_bin() {
-    for bin in apache2 httpd /usr/sbin/apache2 /usr/sbin/httpd; do
+    for bin in apache2 httpd; do
         command -v "${bin}" >/dev/null 2>&1 && echo "${bin}" && return
     done
-    echo "apache2"
+    echo ""
 }
 
 _find_apache2_modules_dir() {
@@ -1447,6 +1461,7 @@ EOF
 }
 
 _svc_start_or_reload_dnsmasq() {
+    _require_binary dnsmasq
     local pid_f; pid_f=$(_dnsmasq_pid)
     if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
         log "dnsmasq: sending SIGHUP to reload (pid=$(cat "${pid_f}"))"
@@ -1454,7 +1469,7 @@ _svc_start_or_reload_dnsmasq() {
     else
         log "dnsmasq: starting in namespace ${NAMESPACE}"
         if ! ip netns exec "${NAMESPACE}" dnsmasq --conf-file="$(_dnsmasq_conf)"; then
-            log "WARNING: dnsmasq start failed — is dnsmasq installed on this host?"
+            die "dnsmasq failed to start — check $(_dnsmasq_conf) and ${LOG_FILE} for details"
         fi
     fi
 }
@@ -1553,6 +1568,7 @@ PYEOF
 }
 
 _svc_reload_haproxy() {
+    _require_binary haproxy
     local conf_f; conf_f=$(_haproxy_conf)
     local pid_f;  pid_f=$(_haproxy_pid)
 
@@ -1563,13 +1579,13 @@ _svc_reload_haproxy() {
             log "WARNING: haproxy reload failed; attempting fresh start"
             rm -f "${pid_f}" 2>/dev/null || true
             if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>/dev/null; then
-                log "WARNING: haproxy start failed — is haproxy installed on this host?"
+                die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
             fi
         fi
     else
         log "haproxy: starting in namespace ${NAMESPACE}"
         if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>/dev/null; then
-            log "WARNING: haproxy start failed — is haproxy installed on this host?"
+            die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
         fi
     fi
 }
@@ -1700,6 +1716,7 @@ EOF
 }
 
 _svc_start_or_reload_apache2() {
+    _require_binary apache2 httpd
     local bin; bin=$(_find_apache2_bin)
     local pid_f; pid_f=$(_apache2_pid)
 
@@ -1710,7 +1727,7 @@ _svc_start_or_reload_apache2() {
     else
         log "apache2: starting in namespace ${NAMESPACE}"
         if ! ip netns exec "${NAMESPACE}" "${bin}" -f "$(_apache2_conf)" -k start 2>/dev/null; then
-            log "WARNING: apache2 start failed — is apache2/httpd installed on this host?"
+            die "apache2/httpd failed to start — check $(_apache2_conf) and ${LOG_FILE} for details"
         fi
     fi
 
@@ -1886,6 +1903,7 @@ cmd_config_dhcp_subnet() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "config-dhcp-subnet: network=${NETWORK_ID} ns=${NAMESPACE} gw=${GATEWAY} cidr=${CIDR}"
     [ -z "${GATEWAY}" ] && die "config-dhcp-subnet: missing --gateway"
     [ -z "${CIDR}" ]    && die "config-dhcp-subnet: missing --cidr"
@@ -1904,6 +1922,7 @@ cmd_config_dns_subnet() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "config-dns-subnet: network=${NETWORK_ID} ns=${NAMESPACE} gw=${GATEWAY} cidr=${CIDR}"
     [ -z "${GATEWAY}" ] && die "config-dns-subnet: missing --gateway"
     [ -z "${CIDR}" ]    && die "config-dns-subnet: missing --cidr"
@@ -1951,6 +1970,7 @@ cmd_remove_dns_subnet() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "remove-dns-subnet: network=${NETWORK_ID}"
     if [ -f "$(_dnsmasq_conf)" ]; then
         _write_dnsmasq_conf false
@@ -1969,6 +1989,7 @@ cmd_add_dhcp_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "add-dhcp-entry: network=${NETWORK_ID} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
     [ -z "${MAC}" ]   && die "add-dhcp-entry: missing --mac"
     [ -z "${VM_IP}" ] && die "add-dhcp-entry: missing --ip"
@@ -2022,6 +2043,7 @@ cmd_remove_dhcp_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "remove-dhcp-entry: network=${NETWORK_ID} mac=${MAC}"
     [ -z "${MAC}" ] && die "remove-dhcp-entry: missing --mac"
 
@@ -2051,6 +2073,7 @@ cmd_add_dns_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "add-dns-entry: network=${NETWORK_ID} hostname=${HOSTNAME} ip=${VM_IP}"
     [ -z "${VM_IP}" ]    && die "add-dns-entry: missing --ip"
     [ -z "${HOSTNAME}" ] && die "add-dns-entry: missing --hostname"
@@ -2078,6 +2101,7 @@ cmd_remove_dns_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "remove-dns-entry: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "remove-dns-entry: missing --ip"
 
@@ -2102,6 +2126,7 @@ cmd_prepare_nic() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "prepare-nic: network=${NETWORK_ID} ns=${NAMESPACE} guest_type=${GUEST_TYPE} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
 
     # ---- Shared network: lazily implement on first NIC attach ----
@@ -2174,6 +2199,7 @@ cmd_release_nic() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "release-nic: network=${NETWORK_ID} ns=${NAMESPACE} mac=${MAC} ip=${VM_IP}"
 
     local dnsmasq_reloaded="false"
@@ -2230,6 +2256,7 @@ cmd_save_userdata() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-userdata: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "save-userdata: missing --ip"
 
@@ -2258,6 +2285,7 @@ cmd_save_password() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-password: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "save-password: missing --ip"
 
@@ -2287,6 +2315,7 @@ cmd_save_sshkey() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-sshkey: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "save-sshkey: missing --ip"
 
@@ -2311,6 +2340,7 @@ cmd_save_hypervisor_hostname() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-hypervisor-hostname: network=${NETWORK_ID} ip=${VM_IP} host=${HYPERVISOR_HOSTNAME}"
     [ -z "${VM_IP}" ] && die "save-hypervisor-hostname: missing --ip"
 
@@ -2345,6 +2375,7 @@ cmd_save_vm_data() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-vm-data: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ]   && die "save-vm-data: missing --ip"
 
@@ -2802,6 +2833,7 @@ cmd_apply_lb_rules() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary haproxy
     log "apply-lb-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     # Normalise empty input
@@ -3204,6 +3236,9 @@ cmd_restore_network() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
+    _require_binary apache2 httpd
+    _require_binary haproxy
     log "restore-network: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     local restore_data_file=""
