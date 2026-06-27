@@ -3073,6 +3073,11 @@ _pbr_list_rules() {
     fi
 }
 
+_fw_list_rules() {
+    [ -z "${NAMESPACE}" ] && die "list-firewall-rules: namespace not resolved"
+    ip netns exec "${NAMESPACE}" iptables-save 2>/dev/null || true
+}
+
 _pbr_emit_custom_action_result() {
     local action="$1"
     shift
@@ -3103,6 +3108,19 @@ elif action == "pbr-list-routes":
 elif action == "pbr-list-rules":
     data = [{"rule": row} for row in rows]
     print(json.dumps({"status": "success", "printmessage": "true", "message": data}))
+elif action == "list-firewall-rules":
+    tables, cur_table, cur_lines = [], None, []
+    for line in raw.splitlines():
+        line = line.rstrip()
+        if line.startswith('*'):
+            cur_table, cur_lines = line[1:], []
+        elif line == 'COMMIT':
+            if cur_table:
+                tables.append({"table": cur_table, "rules": "\n".join(cur_lines)})
+            cur_table = None
+        elif cur_table and not line.startswith('#'):
+            cur_lines.append(line)
+    print(json.dumps({"status": "success", "printmessage": "true", "message": tables}))
 else:
     msg = rows[0] if rows else f"{action}: OK"
     print(json.dumps({"status": "success", "printmessage": "true", "message": msg}))
@@ -3216,13 +3234,16 @@ cmd_custom_action() {
         pbr-list-rules)
             _pbr_emit_custom_action_result "pbr-list-rules" _pbr_list_rules
             ;;
+        list-firewall-rules)
+            _pbr_emit_custom_action_result "list-firewall-rules" _fw_list_rules
+            ;;
         *)
             local hook="${STATE_DIR}/hooks/custom-action-${ACTION_NAME}.sh"
             if [ -x "${hook}" ]; then
                 exec "${hook}" --network-id "${NETWORK_ID}" --action "${ACTION_NAME}" \
                      --action-params "${ACTION_PARAMS_JSON}"
             else
-                die "Unknown action '${ACTION_NAME}'. Built-ins: reboot-device, dump-config, pbr-*"
+                die "Unknown action '${ACTION_NAME}'. Built-ins: reboot-device, dump-config, list-firewall-rules, pbr-*"
             fi
             ;;
     esac

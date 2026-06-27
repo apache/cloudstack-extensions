@@ -1390,6 +1390,7 @@ Built-in actions:
 |--------|-------------|
 | `reboot-device` | Bounces the guest veth pair (`vh-<vlan>-<id>` down → up) |
 | `dump-config` | Prints namespace IP addresses, iptables rules, and per-network state to stdout |
+| `list-firewall-rules` | List iptables rules inside the namespace |
 | `pbr-create-table` | Create or update a routing-table entry in `/etc/iproute2/rt_tables` |
 | `pbr-delete-table` | Remove a routing-table entry from `/etc/iproute2/rt_tables` |
 | `pbr-list-tables` | List non-comment routing-table entries from `/etc/iproute2/rt_tables` |
