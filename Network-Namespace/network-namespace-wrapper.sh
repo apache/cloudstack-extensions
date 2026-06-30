@@ -530,6 +530,10 @@ parse_args() {
     FW_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.fw_rules")
     ACL_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.acl_rules")
     NETWORK_STATE=$(_payload_json_get "${payload_file}" "payload.network_state")
+    NETWORK_IP6_GATEWAY=$(_payload_json_get "${payload_file}" "payload.network_ip6_gateway")
+    NETWORK_IP6_CIDR=$(_payload_json_get "${payload_file}" "payload.network_ip6_cidr")
+    DNS6_SERVER=$(_payload_json_get "${payload_file}" "payload.dns6")
+    NIC_IP6_ADDRESS=$(_payload_json_get "${payload_file}" "payload.ip6_address")
 
     [ -z "${SOURCE_NAT}" ] && SOURCE_NAT="false"
     [ -z "${LB_RULES_JSON}" ] && LB_RULES_JSON="[]"
@@ -582,10 +586,13 @@ _load_state() {
         done
     }
 
-    _read_sf VLAN        vlan        "${nsd}" "${old}"
-    _read_sf CIDR        cidr        "${nsd}" "${old}"
-    _read_sf GATEWAY     gateway     "${nsd}" "${old}"
-    _read_sf EXTENSION_IP extension-ip "${nsd}" "${old}"
+    _read_sf VLAN             vlan        "${nsd}" "${old}"
+    _read_sf CIDR             cidr        "${nsd}" "${old}"
+    _read_sf GATEWAY          gateway     "${nsd}" "${old}"
+    _read_sf EXTENSION_IP     extension-ip "${nsd}" "${old}"
+    _read_sf NETWORK_IP6_GATEWAY ip6-gateway "${nsd}" "${old}"
+    _read_sf NETWORK_IP6_CIDR    ip6-cidr    "${nsd}" "${old}"
+    _read_sf DNS6_SERVER         dns6        "${nsd}" "${old}"
 
     if [ -z "${NAMESPACE}" ]; then
         # Namespace is VPC-wide: check vpc state dir, then per-net, then legacy.
@@ -635,11 +642,17 @@ cmd_implement_network() {
     # Ensure per-namespace iproute2 rt_tables for PBR isolation
     _pbr_ensure_table_file
 
-    # Disable IPv6 inside the namespace to avoid IPv6 autoconf/link-local behavior
-    # Apply globally and to the default and loopback interfaces. Idempotent.
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+    # IPv6: enable when a guest IPv6 gateway is configured; otherwise disable
+    # globally for standalone networks (VPC tiers only disable per-interface to
+    # avoid clobbering IPv6 state set by sibling tiers in the same namespace).
+    if [ -n "${NETWORK_IP6_GATEWAY}" ]; then
+        _enable_ipv6_in_namespace "${veth_n}"
+        log "implement-network: IPv6 enabled in namespace ${NAMESPACE}"
+    elif [ -z "${VPC_ID}" ]; then
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1     >/dev/null 2>&1 || true
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1      >/dev/null 2>&1 || true
+    fi
 
     # ---- 2. Host bridge + VLAN sub-interface ----
     if [ -n "${VLAN}" ]; then
@@ -688,9 +701,22 @@ cmd_implement_network() {
         fi
     fi
 
-    # Disable IPv6 on the guest veth namespace interface to prevent IPv6 addresses
-    # from appearing on the interface (idempotent)
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".disable_ipv6=1 >/dev/null 2>&1 || true
+    # ---- 4b. Assign IPv6 gateway address to the guest veth ----
+    if [ -n "${NETWORK_IP6_GATEWAY}" ] && [ -n "${NETWORK_IP6_CIDR}" ]; then
+        local ip6_prefix
+        ip6_prefix=$(echo "${NETWORK_IP6_CIDR}" | cut -d'/' -f2)
+        ip netns exec "${NAMESPACE}" ip -6 addr show "${veth_n}" 2>/dev/null | \
+            grep -q "${NETWORK_IP6_GATEWAY}/" || \
+            ip netns exec "${NAMESPACE}" ip -6 addr add \
+                "${NETWORK_IP6_GATEWAY}/${ip6_prefix}" dev "${veth_n}" 2>/dev/null || true
+        log "implement-network: assigned IPv6 ${NETWORK_IP6_GATEWAY}/${ip6_prefix} to ${veth_n}"
+    else
+        # No IPv6 on this interface; disable per-interface to suppress link-local
+        # autoconf.  For VPC tiers skip global disable to avoid breaking sibling
+        # tiers that may have IPv6 enabled.
+        ip netns exec "${NAMESPACE}" sysctl -w \
+            net.ipv6.conf."${veth_n}".disable_ipv6=1 >/dev/null 2>&1 || true
+    fi
 
     if [ "${GUEST_TYPE}" = "isolated" ]; then
          # ---- 5. IP forwarding  (needed for Isolated networks only) ----
@@ -724,6 +750,15 @@ cmd_implement_network() {
     echo "${GATEWAY}" > "${nsd}/gateway"
     echo "${CIDR}"    > "${nsd}/cidr"
     echo "${ext_ip}"  > "${nsd}/extension-ip"
+    if [ -n "${NETWORK_IP6_GATEWAY}" ]; then
+        echo "${NETWORK_IP6_GATEWAY}" > "${nsd}/ip6-gateway"
+    fi
+    if [ -n "${NETWORK_IP6_CIDR}" ]; then
+        echo "${NETWORK_IP6_CIDR}" > "${nsd}/ip6-cidr"
+    fi
+    if [ -n "${DNS6_SERVER}" ]; then
+        echo "${DNS6_SERVER}" > "${nsd}/dns6"
+    fi
 
     # Namespace + VPC tier tracking → vpc-<vpcId>/ (or network-<networkId>/ for isolated)
     local vsd; vsd=$(_vpc_state_dir)
@@ -820,8 +855,9 @@ cmd_shutdown_network() {
         fi
     fi
 
-    # Stop per-network services (dnsmasq, haproxy, apache2, passwd-server)
+    # Stop per-network services (dnsmasq, radvd, haproxy, apache2, passwd-server)
     _svc_stop_dnsmasq
+    _svc_stop_radvd
     _svc_stop_haproxy
     _svc_stop_apache2
     _svc_stop_passwd_server
@@ -890,6 +926,7 @@ cmd_destroy_network() {
 
     # Stop per-network services before removing state
     _svc_stop_dnsmasq
+    _svc_stop_radvd
     _svc_stop_haproxy
     _svc_stop_apache2
     _svc_stop_passwd_server
@@ -1341,6 +1378,10 @@ _dnsmasq_hosts()      { echo "$(_net_state_dir)/dnsmasq/hosts"; }
 _dnsmasq_dhcp_hosts() { echo "$(_net_state_dir)/dnsmasq/dhcp-hosts"; }
 _dnsmasq_dhcp_opts()  { echo "$(_net_state_dir)/dnsmasq/dhcp-opts"; }
 
+_radvd_dir()  { echo "$(_net_state_dir)/radvd"; }
+_radvd_conf() { echo "$(_net_state_dir)/radvd/radvd.conf"; }
+_radvd_pid()  { echo "$(_net_state_dir)/radvd/radvd.pid"; }
+
 _haproxy_dir()  { echo "$(_net_state_dir)/haproxy"; }
 _haproxy_conf() { echo "$(_net_state_dir)/haproxy/haproxy.cfg"; }
 _haproxy_pid()  { echo "$(_net_state_dir)/haproxy/haproxy.pid"; }
@@ -1497,6 +1538,111 @@ _svc_stop_dnsmasq() {
     fi
     # Kill any orphaned dnsmasq for this network
     pkill -f "dnsmasq.*${NETWORK_ID}" 2>/dev/null || true
+}
+
+##############################################################################
+# Helpers: radvd  (IPv6 Router Advertisement)
+##############################################################################
+
+# _enable_ipv6_in_namespace <veth_n>
+# Enables IPv6 forwarding inside the namespace for the given interface.
+# Disables DAD and temporary addresses to avoid tentative/dadfailed states.
+_enable_ipv6_in_namespace() {
+    local veth_n="$1"
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=0   >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.forwarding=1      >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.accept_ra=1       >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.accept_dad=0      >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.accept_dad=0  >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.use_tempaddr=0    >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.use_tempaddr=0 >/dev/null 2>&1 || true
+    if [ -n "${veth_n}" ]; then
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".accept_dad=0   >/dev/null 2>&1 || true
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".use_tempaddr=0 >/dev/null 2>&1 || true
+    fi
+}
+
+# _write_radvd_conf <veth_n> <ip6_gateway> <ip6_cidr> [<dns6>]
+# Generates /radvd/radvd.conf for the given interface and prefix.
+# ip6_cidr must be in CIDR notation (e.g. 2001:db8:1::/64).
+# dns6 is an optional comma-separated list of IPv6 DNS server addresses.
+_write_radvd_conf() {
+    local veth_n="$1" ip6_gw="$2" ip6_cidr="$3" dns6="${4:-}"
+
+    local dir; dir=$(_radvd_dir)
+    mkdir -p "${dir}"
+
+    # Use the network address from ip6_cidr (all interface bits zero) as the
+    # radvd prefix.  Using the gateway address (e.g. ::1/64) causes radvd to
+    # reject the config on strict versions because host bits are set.
+    local prefix_addr prefix_size
+    prefix_addr=$(echo "${ip6_cidr}" | cut -d'/' -f1)
+    prefix_size=$(echo "${ip6_cidr}" | cut -d'/' -f2)
+
+    cat > "$(_radvd_conf)" << EOF
+# Auto-generated by network-namespace-wrapper.sh — do not edit
+interface ${veth_n}
+{
+    AdvSendAdvert on;
+    MinRtrAdvInterval 5;
+    MaxRtrAdvInterval 15;
+    prefix ${prefix_addr}/${prefix_size}
+    {
+        AdvOnLink on;
+        AdvAutonomous on;
+    };
+EOF
+
+    if [ -n "${dns6}" ]; then
+        local dns
+        # shellcheck disable=SC2086
+        for dns in $(echo "${dns6}" | tr ',' ' '); do
+            [ -z "${dns}" ] && continue
+            cat >> "$(_radvd_conf)" << EOF
+    RDNSS ${dns}
+    {
+        AdvRDNSSLifetime 30;
+    };
+EOF
+        done
+    fi
+
+    echo "};" >> "$(_radvd_conf)"
+    log "radvd: wrote config $(_radvd_conf)"
+}
+
+_svc_start_or_reload_radvd() {
+    _require_binary radvd
+    local pid_f; pid_f=$(_radvd_pid)
+    if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
+        log "radvd: sending SIGHUP to reload (pid=$(cat "${pid_f}"))"
+        kill -HUP "$(cat "${pid_f}")" 2>/dev/null || true
+    else
+        log "radvd: starting in namespace ${NAMESPACE}"
+        local _ct_out
+        # Use 'if !' to prevent set -e from killing the script on radvd failure.
+        # Flag mapping (this radvd build): -C PATH = config file, -c = configtest.
+        if ! _ct_out=$(ip netns exec "${NAMESPACE}" radvd \
+                -C "$(_radvd_conf)" -c 2>&1); then
+            die "radvd config test failed: ${_ct_out}"
+        fi
+        ip netns exec "${NAMESPACE}" radvd \
+            -C "$(_radvd_conf)" \
+            -p "$(_radvd_pid)"  \
+            -m syslog
+        log "radvd: started in namespace ${NAMESPACE}"
+    fi
+}
+
+_svc_stop_radvd() {
+    local pid_f; pid_f=$(_radvd_pid)
+    if [ -f "${pid_f}" ]; then
+        local pid; pid=$(cat "${pid_f}")
+        kill "${pid}" 2>/dev/null || true
+        rm -f "${pid_f}"
+        log "radvd: stopped (pid=${pid})"
+    fi
 }
 
 ##############################################################################
@@ -1922,6 +2068,25 @@ cmd_config_dhcp_subnet() {
     [ -z "${CIDR}" ]    && die "config-dhcp-subnet: missing --cidr"
     _write_dnsmasq_conf false
     _svc_start_or_reload_dnsmasq
+    if [ -n "${NETWORK_IP6_GATEWAY}" ] && [ -n "${NETWORK_IP6_CIDR}" ]; then
+        local veth_n; veth_n=$(veth_ns_name "${VLAN}" "${CHOSEN_ID}")
+        # implement-network may have run before CloudStack assigned the IPv6
+        # gateway to this network.  Ensure the namespace is configured for IPv6,
+        # the gateway address is on the veth, and state files are persisted so
+        # that subsequent commands and the discovery path can find them.
+        _enable_ipv6_in_namespace "${veth_n}"
+        local ip6_prefix; ip6_prefix=$(echo "${NETWORK_IP6_CIDR}" | cut -d'/' -f2)
+        ip netns exec "${NAMESPACE}" ip -6 addr show "${veth_n}" 2>/dev/null | \
+            grep -q "${NETWORK_IP6_GATEWAY}/" || \
+            ip netns exec "${NAMESPACE}" ip -6 addr add \
+                "${NETWORK_IP6_GATEWAY}/${ip6_prefix}" dev "${veth_n}" 2>/dev/null || true
+        local nsd; nsd=$(_net_state_dir)
+        [ -f "${nsd}/ip6-gateway" ] || echo "${NETWORK_IP6_GATEWAY}" > "${nsd}/ip6-gateway"
+        [ -f "${nsd}/ip6-cidr"    ] || echo "${NETWORK_IP6_CIDR}"    > "${nsd}/ip6-cidr"
+        [ -n "${DNS6_SERVER}" ] && { [ -f "${nsd}/dns6" ] || echo "${DNS6_SERVER}" > "${nsd}/dns6"; }
+        _write_radvd_conf "${veth_n}" "${NETWORK_IP6_GATEWAY}" "${NETWORK_IP6_CIDR}" "${DNS6_SERVER}"
+        _svc_start_or_reload_radvd
+    fi
     release_lock
     log "config-dhcp-subnet: done network=${NETWORK_ID}"
 }
@@ -1954,6 +2119,21 @@ cmd_config_dns_subnet() {
 
     _write_dnsmasq_conf true
     _svc_start_or_reload_dnsmasq
+    if [ -n "${NETWORK_IP6_GATEWAY}" ] && [ -n "${NETWORK_IP6_CIDR}" ]; then
+        local veth_n; veth_n=$(veth_ns_name "${VLAN}" "${CHOSEN_ID}")
+        _enable_ipv6_in_namespace "${veth_n}"
+        local ip6_prefix; ip6_prefix=$(echo "${NETWORK_IP6_CIDR}" | cut -d'/' -f2)
+        ip netns exec "${NAMESPACE}" ip -6 addr show "${veth_n}" 2>/dev/null | \
+            grep -q "${NETWORK_IP6_GATEWAY}/" || \
+            ip netns exec "${NAMESPACE}" ip -6 addr add \
+                "${NETWORK_IP6_GATEWAY}/${ip6_prefix}" dev "${veth_n}" 2>/dev/null || true
+        local nsd; nsd=$(_net_state_dir)
+        [ -f "${nsd}/ip6-gateway" ] || echo "${NETWORK_IP6_GATEWAY}" > "${nsd}/ip6-gateway"
+        [ -f "${nsd}/ip6-cidr"    ] || echo "${NETWORK_IP6_CIDR}"    > "${nsd}/ip6-cidr"
+        [ -n "${DNS6_SERVER}" ] && { [ -f "${nsd}/dns6" ] || echo "${DNS6_SERVER}" > "${nsd}/dns6"; }
+        _write_radvd_conf "${veth_n}" "${NETWORK_IP6_GATEWAY}" "${NETWORK_IP6_CIDR}" "${DNS6_SERVER}"
+        _svc_start_or_reload_radvd
+    fi
     release_lock
     log "config-dns-subnet: done network=${NETWORK_ID}"
 }
@@ -1969,7 +2149,8 @@ cmd_remove_dhcp_subnet() {
     acquire_lock "${NETWORK_ID}"
     log "remove-dhcp-subnet: network=${NETWORK_ID}"
     _svc_stop_dnsmasq
-    rm -rf "$(_dnsmasq_dir)"
+    _svc_stop_radvd
+    rm -rf "$(_dnsmasq_dir)" "$(_radvd_dir)"
     release_lock
     log "remove-dhcp-subnet: done network=${NETWORK_ID}"
 }
@@ -2100,6 +2281,13 @@ cmd_add_dns_entry() {
     mv "${hosts}.tmp" "${hosts}"
     echo "${VM_IP} ${HOSTNAME}" >> "${hosts}"
 
+    # Also add AAAA record when an IPv6 address is provided for this NIC
+    if [ -n "${NIC_IP6_ADDRESS}" ]; then
+        grep -v "^${NIC_IP6_ADDRESS}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
+        mv "${hosts}.tmp" "${hosts}"
+        echo "${NIC_IP6_ADDRESS} ${HOSTNAME}" >> "${hosts}"
+    fi
+
     _svc_start_or_reload_dnsmasq
     release_lock
     log "add-dns-entry: done ${VM_IP} ${HOSTNAME}"
@@ -2122,6 +2310,11 @@ cmd_remove_dns_entry() {
     if [ -f "${hosts}" ]; then
         grep -v "^${VM_IP}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
         mv "${hosts}.tmp" "${hosts}"
+        # Also remove the AAAA record when an IPv6 address was associated
+        if [ -n "${NIC_IP6_ADDRESS}" ]; then
+            grep -v "^${NIC_IP6_ADDRESS}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
+            mv "${hosts}.tmp" "${hosts}"
+        fi
         _svc_start_or_reload_dnsmasq
     fi
     release_lock
@@ -3561,10 +3754,8 @@ cmd_implement_vpc() {
     # Ensure per-namespace iproute2 rt_tables for PBR isolation
     _pbr_ensure_table_file
 
-    # Disable IPv6 inside the namespace
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+    # IPv6 is managed per-tier by implement-network: each VPC tier enables or
+    # disables IPv6 on its own guest veth without touching sibling tiers.
 
     # ---- 2. IP forwarding ----
     ip netns exec "${NAMESPACE}" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
