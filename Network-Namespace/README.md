@@ -648,8 +648,11 @@ network-namespace.sh destroy-network  --network-id 42 --vlan 100
 6. For **VPC tier** networks: deregisters this tier from the VPC — namespace is
    only removed by a subsequent `destroy-vpc` call.
 
-> The host bridge `breth1-100` and VLAN sub-interface `eth1.100` are **not**
-> removed — they may still be used by other networks or for VM connectivity.
+> The host bridge `breth1-100` and VLAN sub-interface `eth1.100` are removed
+> once nothing else is attached to the bridge (checked via
+> `teardown_host_bridge_if_unused`). If another network/tenant is still
+> sharing the same physical VLAN, or a VM tap is still attached, the bridge
+> and VLAN sub-interface are left in place.
 
 ### 9. Unregister and delete the extension
 
@@ -886,8 +889,9 @@ Actions:
    removed by a subsequent `destroy-vpc` call.
 
 > The host bridge `br<GUEST_ETH>-<vlan>` and VLAN sub-interface `GUEST_ETH.<vlan>`
-> are NOT removed on destroy — they may still be used by other networks or for
-> VM connectivity.
+> are removed on destroy once the bridge has no remaining member interfaces
+> (`teardown_host_bridge_if_unused`). This is a no-op if another network/tenant
+> is still sharing the same physical VLAN, or a VM tap is still attached.
 
 ### VPC lifecycle commands: `implement-vpc`, `update-vpc-source-nat-ip`, `shutdown-vpc`, `destroy-vpc`
 
@@ -1042,7 +1046,10 @@ Actions:
 4. Remove host route `<public-ip>/32`.
 5. Remove IP address from `vpn-<pvlan>-<id>` inside namespace.
 6. If no other IPs share the same `<pvlan>/<id>` combination, delete
-   `vph-<pvlan>-<id>` (host veth).
+   `vph-<pvlan>-<id>` (host veth), then attempt to remove the public bridge
+   `br<PUB_ETH>-<pvlan>` and VLAN sub-interface `PUB_ETH.<pvlan>` — a no-op
+   (`teardown_host_bridge_if_unused`) if another network/tenant is still
+   sharing the same public VLAN.
 7. Remove state files.
 
 ### `add-static-nat`

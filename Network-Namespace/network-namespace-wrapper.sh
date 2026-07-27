@@ -456,6 +456,47 @@ ensure_host_bridge() {
     echo "${br}"
 }
 
+# teardown_host_bridge_if_unused <eth> <vlan>
+# Counterpart to ensure_host_bridge(): removes the VLAN sub-interface (ethX.vlan)
+# and the bridge (br<eth>-<vlan>) it created, but ONLY if no VM (or other
+# consumer, e.g. another VPC tier/network/tenant riding the same public VLAN)
+# still has an interface plugged into the bridge.
+#
+# ensure_host_bridge() always enslaves the VLAN uplink (ethX.vlan) into the
+# bridge, so it is always present as a bridge member — it must be excluded
+# from the "is anything still using this bridge" check, otherwise the bridge
+# would never be considered unused.
+#
+# Safe to call unconditionally from any teardown path — it is a no-op
+# whenever the bridge is still in use (by a VM tap or otherwise), or already
+# gone.
+teardown_host_bridge_if_unused() {
+    local eth="$1" vlan_raw="$2" vlan br vif members
+    vlan=$(normalize_vlan "${vlan_raw}")
+    br=$(host_bridge_name "${eth}" "${vlan}")
+    vif="${eth}.${vlan}"
+
+    if ! ip link show "${br}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -d "/sys/class/net/${br}/brif" ]; then
+        members=$(ls -A "/sys/class/net/${br}/brif" 2>/dev/null | grep -v -x "${vif}" || true)
+        if [ -n "${members}" ]; then
+            log "teardown_host_bridge_if_unused: ${br} still has member interfaces (${members}), leaving in place"
+            return 0
+        fi
+    fi
+
+    ip link del "${br}" 2>/dev/null || true
+    log "Removed host bridge ${br}"
+
+    if ip link show "${vif}" >/dev/null 2>&1; then
+        ip link del "${vif}" 2>/dev/null || true
+        log "Removed VLAN interface ${vif}"
+    fi
+}
+
 # _guard_ns_teardown <caller-label>
 # When network_state is "shutdown", "destroy", or "allocated" and the namespace
 # is already gone, exit successfully — the network has been torn down or was
@@ -896,6 +937,13 @@ cmd_destroy_network() {
     veth_h=$(veth_host_name "${VLAN}" "${CHOSEN_ID}")
     ip link del "${veth_h}" 2>/dev/null || true
 
+    # The guest VLAN bridge/sub-interface (ensure_host_bridge) is where VM taps
+    # are plugged in directly by the hypervisor. Destroying a network implies
+    # no VMs remain on it, so it is safe to tear these down here (guarded by
+    # teardown_host_bridge_if_unused() in case anything unexpected is still
+    # attached).
+    teardown_host_bridge_if_unused "${GUEST_ETH}" "${VLAN}"
+
     local vsd; vsd=$(_vpc_state_dir)
 
     # Public veth pairs and their state files only exist for Isolated networks
@@ -920,6 +968,9 @@ cmd_destroy_network() {
                 pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
                 ip link del "${pveth_h}" 2>/dev/null || true
                 rm -f "${f}" "${f%.pvlan}" "${tier_f}" 2>/dev/null || true
+                # Public bridge may be shared by other tiers/networks/tenants on
+                # the same public VLAN; only removed once nothing else uses it.
+                teardown_host_bridge_if_unused "${PUB_ETH}" "${pvlan}"
             done
         fi
     fi
@@ -1127,6 +1178,9 @@ cmd_release_ip() {
     if [ "${remaining}" -eq 0 ]; then
         ip link del "${pveth_h}" 2>/dev/null || true
         log "release-ip: removed public veth ${pveth_h}"
+        # Public bridge may still be shared by other networks/tenants on the
+        # same public VLAN; only removed once nothing else uses it.
+        teardown_host_bridge_if_unused "${PUB_ETH}" "${PUBLIC_VLAN}"
     fi
 
     # Remove default route if no IPs remain
