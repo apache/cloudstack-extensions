@@ -2899,9 +2899,6 @@ egress_rules  = [r for r in rules if r.get('type') == 'egress']
 # Handles only outbound guest-VM traffic (-i <veth_n>).
 # ---------------------------------------------------------------------------
 
-# Allow established/related first so ongoing sessions are never interrupted.
-iptf('-A', fw_chain, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
-
 # Explicit egress rules.
 # default_egress_allow=true  → explicit rules are DROP  (deny specific traffic)
 # default_egress_allow=false → explicit rules are ACCEPT (allow specific traffic)
@@ -2951,6 +2948,11 @@ else:
 # RETURN so that fchain catch-all rules (static-NAT, PF, etc.) remain active
 # for any non-VM traffic that reaches this chain.
 iptf('-A', fw_chain, '-j', 'RETURN')
+
+# Insert established/related last so it lands at position 1 regardless of what
+# was appended above — ongoing sessions must never be re-evaluated against the
+# explicit egress rules/default policy, no matter how this chain is built.
+iptf('-I', fw_chain, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
 
 # ---------------------------------------------------------------------------
 # PART 2 – Ingress firewall in mangle table, PREROUTING hook (before DNAT)
@@ -3020,10 +3022,12 @@ for pub_ip, ip_rules in pub_ip_rules.items():
             a += ['-j', 'RETURN']
             iptm(*a)
 
-    # Always allow packets belonging to an already-established session.
-    iptm('-A', chain_name, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
     # Default: drop new connections not matched by any explicit rule above.
     iptm('-A', chain_name, '-j', 'DROP')
+    # Insert established/related last so it lands at position 1 regardless of
+    # what was appended above — active sessions must never be re-evaluated
+    # against the explicit rules/deny-all, no matter how this chain is built.
+    iptm('-I', chain_name, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
 
 # Step 3: create default-DROP chains for static-NAT IPs that have no ingress
 # rules in this invocation.  Without this, removing all firewall rules for a
@@ -3041,8 +3045,10 @@ if os.path.isdir(static_nat_dir):
         chain_name = FW_INGRESS_PREFIX + pub_ip
         iptm('-N', chain_name)
         iptm('-A', 'PREROUTING', '-d', f'{pub_ip}/32', '-j', chain_name)
-        iptm('-A', chain_name, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
         iptm('-A', chain_name, '-j', 'DROP')
+        # Insert established/related last so it lands at position 1 (see the
+        # main pub_ip_rules loop above for why).
+        iptm('-I', chain_name, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
         n_protected += 1
 
 n_in  = sum(len(v) for v in pub_ip_rules.values())
@@ -4133,8 +4139,6 @@ if rules_json:
 else:
     rules = []
 
-# Always allow RELATED,ESTABLISHED so active sessions are not dropped.
-iptf('-A', acl_chain, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
 
 for rule in sorted(rules, key=lambda r: r.get('number', 999)):
     direction  = rule.get('trafficType', 'ingress').lower()
@@ -4181,6 +4185,11 @@ for rule in sorted(rules, key=lambda r: r.get('number', 999)):
 
 # Default: DROP all unmatched traffic (implicit deny at end of ACL)
 iptf('-A', acl_chain, '-j', 'DROP')
+
+# Insert RELATED,ESTABLISHED last so it lands at position 1 regardless of what
+# was appended above — active sessions must never be re-evaluated against the
+# explicit rules/deny-all, no matter how this chain is built.
+iptf('-I', acl_chain, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
 
 print(f"apply-network-acl: applied {len(rules)} ACL rule(s) to chain {acl_chain}")
 PYEOF
