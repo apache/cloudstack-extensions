@@ -4091,7 +4091,17 @@ cmd_apply_network_acl() {
     acl_chain_name=$(acl_chain "${NETWORK_ID}")
     fchain=$(filter_chain "${NETWORK_ID}")
 
-    # ---- 1. Remove existing jump from fchain to acl chain (idempotent) ----
+    # ---- 1. Remove existing jump(s) from fchain to acl chain (idempotent) ----
+    # Jumps are scoped by interface (-i/-o, see step 5 below) so both forms
+    # must be removed here — an unscoped jump from an older run of this
+    # script, if one is still present, is cleared out too. If any reference
+    # to acl_chain_name survives this step, the -X delete in step 2 fails
+    # silently (chain still in use) and the -N create in step 3 then fails
+    # with "Chain already exists" on the next call.
+    ip netns exec "${NAMESPACE}" iptables -t filter \
+        -D "${fchain}" -i "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
+    ip netns exec "${NAMESPACE}" iptables -t filter \
+        -D "${fchain}" -o "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
     ip netns exec "${NAMESPACE}" iptables -t filter \
         -D "${fchain}" -j "${acl_chain_name}" 2>/dev/null || true
 
@@ -4206,10 +4216,22 @@ PYEOF
 
     # ---- 5. Insert jump from fchain to acl chain at position 1 ----
     # ACL rules take precedence over the catch-all ACCEPT rules in fchain.
+    #
+    # The jump MUST be scoped to this network's own veth (-o for traffic
+    # heading to the guest, -i for traffic coming from it). All tiers in a
+    # VPC share one namespace and one top-level FORWARD chain, so an
+    # unconditional jump here would hand every OTHER tier's traffic to this
+    # ACL chain too — and since the chain ends in an unconditional catch-all
+    # DROP (the implicit deny), it would silently swallow packets for tiers
+    # evaluated after this one, before they ever reach their own (correct)
+    # ACL chain. Scoping by interface keeps each tier's implicit deny from
+    # catching anything but its own traffic.
     if ip netns exec "${NAMESPACE}" iptables -t filter -n -L "${fchain}" >/dev/null 2>&1; then
         ip netns exec "${NAMESPACE}" iptables -t filter \
-            -I "${fchain}" 1 -j "${acl_chain_name}" 2>/dev/null || true
-        log "apply-network-acl: inserted ACL jump in ${fchain}"
+            -I "${fchain}" 1 -i "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -I "${fchain}" 1 -o "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
+        log "apply-network-acl: inserted ACL jump in ${fchain} (scoped to ${veth_n})"
     fi
 
     release_lock
