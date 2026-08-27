@@ -382,6 +382,31 @@ nat_chain()    { echo "${CHAIN_PREFIX}_${1}"; }
 filter_chain()   { echo "${CHAIN_PREFIX}_FWD_${1}"; }
 firewall_chain() { echo "${CHAIN_PREFIX}_FWRULES_${1}"; }
 acl_chain()      { echo "${CHAIN_PREFIX}_ACL_${1}"; }
+# Per-public-IP ingress chain in the mangle table (PREROUTING, before DNAT).
+# Must match FW_INGRESS_PREFIX in cmd_apply_fw_rules' embedded Python — that
+# code rebuilds/replaces these chains from the full firewall-rule payload,
+# so anything created here under the same name is properly superseded the
+# next time apply-fw-rules runs.
+fw_ingress_chain() { echo "CS_EXTNET_FWI_${1}"; }
+
+# Ensure a default-DROP mangle ingress chain exists for a public IP that has
+# no firewall rules of its own yet — e.g. a static-NAT IP right after
+# enable-static-nat, before any explicit Firewall rule has been created for
+# it. Without this, a newly static-NAT'd IP has no ingress chain at all and
+# falls through the default-ACCEPT policy of the top-level FORWARD chain,
+# making the VM reachable on every port despite CloudStack's contract that
+# enabling static NAT alone must NOT open any traffic. Idempotent — safe to
+# call on every add-static-nat.
+_ensure_default_deny_ingress_chain() {
+    local public_ip="$1"
+    local chain; chain=$(fw_ingress_chain "${public_ip}")
+    ip netns exec "${NAMESPACE}" iptables -t mangle -N "${chain}" 2>/dev/null || return 0
+    ip netns exec "${NAMESPACE}" iptables -t mangle \
+        -A PREROUTING -d "${public_ip}/32" -j "${chain}"
+    ip netns exec "${NAMESPACE}" iptables -t mangle -A "${chain}" -j DROP
+    ip netns exec "${NAMESPACE}" iptables -t mangle \
+        -I "${chain}" 1 -m state --state RELATED,ESTABLISHED -j RETURN
+}
 
 ensure_public_ip_on_namespace() {
     local public_ip="$1" public_cidr="$2" pveth_n="$3" pveth_h="$4" addr_spec prefix
@@ -830,6 +855,18 @@ cmd_shutdown_network() {
 
     log "shutdown-network: network=${NETWORK_ID} ns=${NAMESPACE} guest_type=${GUEST_TYPE} vpc=${VPC_ID}"
 
+    # Stop per-network services (dnsmasq, radvd, haproxy, apache2, passwd-server)
+    # BEFORE removing any veth below. These services bind directly to the
+    # guest/public veth interfaces; yanking an interface out from under a
+    # still-running dnsmasq/haproxy/radvd causes spurious errors (e.g.
+    # dnsmasq logs "error binding DHCP socket to device <veth>" right as it
+    # receives SIGTERM) instead of a clean shutdown.
+    _svc_stop_dnsmasq
+    _svc_stop_radvd
+    _svc_stop_haproxy
+    _svc_stop_apache2
+    _svc_stop_passwd_server
+
     # iptables NAT/FILTER chains only exist for non-Shared networks (Shared
     # networks have no routing/NAT role; chains are never created for them).
     if [ "${GUEST_TYPE}" = "isolated" ]; then
@@ -895,13 +932,6 @@ cmd_shutdown_network() {
                    "${STATE_DIR}/network-${NETWORK_ID}/port-forward" 2>/dev/null || true
         fi
     fi
-
-    # Stop per-network services (dnsmasq, radvd, haproxy, apache2, passwd-server)
-    _svc_stop_dnsmasq
-    _svc_stop_radvd
-    _svc_stop_haproxy
-    _svc_stop_apache2
-    _svc_stop_passwd_server
 
     # For isolated and Shared networks delete the namespace directly.
     # VPC namespaces are shared across tiers and must only be deleted
@@ -1234,6 +1264,22 @@ cmd_add_static_nat() {
 
     ensure_public_ip_on_namespace "${PUBLIC_IP}" "${PUBLIC_CIDR}" "${pveth_n}" "${pveth_h}"
 
+    # Block all ingress to this IP by default until an explicit Firewall
+    # rule opens it (matches cmd_apply_fw_rules' handling of static-NAT IPs
+    # with no rules yet — see _ensure_default_deny_ingress_chain). Must run
+    # before the DNAT rule below: mangle PREROUTING is evaluated before nat
+    # PREROUTING in netfilter's packet path, so this DROP takes effect
+    # regardless of ordering here, but doing it first keeps the "no traffic
+    # until firewall opens it" contract true for the whole time this IP is
+    # static-NAT'd, with no gap.
+    #
+    # VPC tiers only: skip this. VPC ingress is governed entirely by
+    # NetworkACL (the ACL_<netid> filter chain), not the Firewall service —
+    # a mangle-level DROP here would run upstream of that chain and block
+    # traffic the tier's ACL explicitly allows, with no way for the ACL to
+    # ever override it.
+    [ -z "${VPC_ID}" ] && _ensure_default_deny_ingress_chain "${PUBLIC_IP}"
+
     # DNAT: inbound public IP → private IP (PREROUTING)
     ip netns exec "${NAMESPACE}" iptables -t nat \
         -C "${nchain_pr}" -d "${PUBLIC_IP}" -j DNAT --to-destination "${PRIVATE_IP}" 2>/dev/null || \
@@ -1486,9 +1532,14 @@ _find_apache2_bin() {
 }
 
 _find_apache2_modules_dir() {
+    # openSUSE ships httpd modules directly under /usr/lib64/apache2(-prefork)/
+    # rather than in a "modules" subdirectory (Debian/Ubuntu: .../apache2/modules,
+    # RHEL family: .../httpd/modules). Prefer the MPM-matched -prefork directory
+    # since /usr/sbin/httpd on openSUSE is a prefork-only build.
     for d in /usr/lib/apache2/modules /usr/lib64/apache2/modules \
               /usr/libexec/apache2   /usr/lib/httpd/modules \
-              /usr/libexec/httpd  /usr/lib64/httpd/modules/; do
+              /usr/libexec/httpd  /usr/lib64/httpd/modules/ \
+              /usr/lib64/apache2-prefork /usr/lib64/apache2; do
         [ -d "${d}" ] && echo "${d}" && return
     done
     echo "/usr/lib/apache2/modules"
@@ -1568,8 +1619,80 @@ EOF
     log "dnsmasq: wrote config $(_dnsmasq_conf) (dns_enabled=${dns_enabled})"
 }
 
+# On distros that confine per-network-service daemons with AppArmor (e.g.
+# openSUSE), the packaged profile only allows the daemon to read/write its
+# own well-known system paths (/etc/dnsmasq*, /etc/haproxy/*,
+# /var/lib/libvirt/dnsmasq/, /var/lib/haproxy/stats*, ...). It has no
+# allowance for the extension's own runtime paths under
+# /var/lib/cloudstack/extnet-*/ or /var/log/cloudstack/extensions/*/, so the
+# daemon fails with "Permission denied" opening them even though the files
+# themselves are 0644/0755 root:root — the profile silently supersedes the
+# files' own DAC permissions. Grant access via each profile's supported
+# local-override include (`include if exists <local/usr.sbin.NAME>`)
+# instead of editing the packaged profile, which a package update would
+# overwrite. No-op when AppArmor isn't installed/enabled or the named
+# profile isn't present (Ubuntu/Rocky/Oracle Linux don't confine these
+# daemons this way).
+#
+# Args: $1 = profile filename under /etc/apparmor.d/ (e.g. usr.sbin.dnsmasq)
+#       $2... = one or more raw AppArmor rule lines to ensure are present
+_ensure_apparmor_access() {
+    local profile_name="$1"; shift
+    command -v aa-status >/dev/null 2>&1 || return 0
+    aa-status --enabled >/dev/null 2>&1 || return 0
+    local profile="/etc/apparmor.d/${profile_name}"
+    [ -f "${profile}" ] || return 0
+
+    local override_dir="/etc/apparmor.d/local"
+    local override="${override_dir}/${profile_name}"
+    mkdir -p "${override_dir}"
+    local rule changed=false
+    for rule in "$@"; do
+        if ! grep -qF "${rule}" "${override}" 2>/dev/null; then
+            echo "${rule}" >> "${override}"
+            log "apparmor: granted ${profile_name} access: ${rule}"
+            changed=true
+        fi
+    done
+    if [ "${changed}" = "true" ] && command -v apparmor_parser >/dev/null 2>&1; then
+        apparmor_parser -r "${profile}" 2>/dev/null \
+            && log "apparmor: reloaded profile ${profile}" \
+            || log "apparmor: failed to reload profile ${profile} (will retry next call)"
+    fi
+}
+
+_ensure_apparmor_dnsmasq_access() {
+    _ensure_apparmor_access "usr.sbin.dnsmasq" \
+        "/var/lib/cloudstack/extnet-*/** rwk," \
+        "/var/log/cloudstack/extensions/*/dnsmasq-*.log w,"
+}
+
+_ensure_apparmor_haproxy_access() {
+    # Beyond read/write/lock, a graceful reload (-sf <pid>) has the new
+    # haproxy process preserve the running one's admin/stats UNIX socket by
+    # hard-linking haproxy.sock.<pid>.bak -> haproxy.sock. AppArmor mediates
+    # link(2) as its own permission bit ('l'), separate from r/w/k, so
+    # without it the reload fails with "Permission denied ... trying to
+    # preserve previous UNIX socket" even though rwk already covers the
+    # same path (confirmed against the kernel audit log: `operation="link"
+    # ... requested_mask="l" denied_mask="l"`).
+    _ensure_apparmor_access "usr.sbin.haproxy" \
+        "/var/lib/cloudstack/extnet-*/** rwkl,"
+}
+
 _svc_start_or_reload_dnsmasq() {
     _require_binary dnsmasq
+    # The namespace may already be gone by the time this runs — e.g. a
+    # remove-dhcp-entry/remove-dns-entry call for a NIC that arrives after
+    # the network itself was already torn down (shutdown-network deletes
+    # the namespace). Starting dnsmasq against a nonexistent namespace
+    # always fails; treat it as a no-op rather than a fatal error, the
+    # same way _require_binary treats a missing binary during teardown.
+    if ! ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        log "dnsmasq: namespace ${NAMESPACE} no longer exists — skipping start/reload"
+        return 0
+    fi
+    _ensure_apparmor_dnsmasq_access
     local pid_f; pid_f=$(_dnsmasq_pid)
     if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
         log "dnsmasq: sending SIGHUP to reload (pid=$(cat "${pid_f}"))"
@@ -1782,24 +1905,53 @@ PYEOF
 
 _svc_reload_haproxy() {
     _require_binary haproxy
+    # The namespace may already be gone by the time this runs — e.g.
+    # removeFromLoadBalancerRule during VM expunge re-applies LB rules for
+    # a network that was already torn down. Starting haproxy against a
+    # nonexistent namespace always fails; treat it as a no-op rather than
+    # a fatal error, same as _svc_start_or_reload_dnsmasq.
+    if ! ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        log "haproxy: namespace ${NAMESPACE} no longer exists — skipping start/reload"
+        return 0
+    fi
     local conf_f; conf_f=$(_haproxy_conf)
     local pid_f;  pid_f=$(_haproxy_pid)
 
+    _ensure_apparmor_haproxy_access
+
+    # _die_unless_namespace_race <error output> — the pre-flight `ip netns
+    # list` check above is inherently racy: a concurrent shutdown-network
+    # (e.g. a background cleanup thread tearing down this same network)
+    # can delete the namespace in the window between that check and the
+    # actual `ip netns exec` below. When that specific race is what
+    # happened, the tool being exec'd reports it losing the namespace out
+    # from under it, not a config/environment problem — treat that as the
+    # same benign no-op the pre-flight check itself grants, instead of
+    # failing the whole apply-lb-rules call over a network that's already
+    # gone anyway.
+    _die_unless_namespace_race() {
+        if [[ "$1" == *"Cannot open network namespace"* ]]; then
+            log "haproxy: namespace ${NAMESPACE} disappeared mid-start (race with concurrent teardown) — skipping"
+            return 0
+        fi
+        log "haproxy start error: $1"
+        die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
+    }
+
+    local start_err
     if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
         log "haproxy: reloading"
-        if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" \
-                -sf "$(cat "${pid_f}")" 2>/dev/null; then
-            log "WARNING: haproxy reload failed; attempting fresh start"
+        start_err=$(ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" \
+                -sf "$(cat "${pid_f}")" 2>&1) || {
+            log "WARNING: haproxy reload failed (${start_err}); attempting fresh start"
             rm -f "${pid_f}" 2>/dev/null || true
-            if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>/dev/null; then
-                die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
-            fi
-        fi
+            start_err=$(ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>&1) || \
+                _die_unless_namespace_race "${start_err}"
+        }
     else
         log "haproxy: starting in namespace ${NAMESPACE}"
-        if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>/dev/null; then
-            die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
-        fi
+        start_err=$(ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>&1) || \
+            _die_unless_namespace_race "${start_err}"
     fi
 }
 
@@ -1876,11 +2028,19 @@ CGISCRIPT
     chmod +x "${cgi}"
 
     # ---- Detect MPM module ----
+    # Some builds (e.g. openSUSE's /usr/sbin/httpd) compile the MPM in
+    # statically rather than shipping it as a loadable .so — neither
+    # mod_mpm_event.so nor mod_mpm_prefork.so exists anywhere on such
+    # hosts. Loading a module that isn't there is fatal (httpd refuses to
+    # start), so only emit the LoadModule line when the .so actually
+    # exists; otherwise assume the running binary already has an MPM built in.
     local mpm_mod="mpm_event_module"
     local mpm_so="mod_mpm_event.so"
     if [ ! -f "${mods}/${mpm_so}" ] && [ -f "${mods}/mod_mpm_prefork.so" ]; then
         mpm_mod="mpm_prefork_module"; mpm_so="mod_mpm_prefork.so"
     fi
+    local mpm_line=""
+    [ -f "${mods}/${mpm_so}" ] && mpm_line="LoadModule ${mpm_mod} ${mods}/${mpm_so}"
 
     # ---- Check for authz_core (required in apache2 >= 2.4) ----
     local authz_line=""
@@ -1906,7 +2066,7 @@ Listen ${listen_ip}:80
 #User ${apuser}
 #Group ${apuser}
 
-LoadModule ${mpm_mod} ${mods}/${mpm_so}
+${mpm_line}
 LoadModule cgi_module ${mods}/mod_cgi.so
 LoadModule alias_module ${mods}/mod_alias.so
 ${unixd_line}
@@ -1930,6 +2090,14 @@ EOF
 
 _svc_start_or_reload_apache2() {
     _require_binary apache2 httpd
+    # The namespace may already be gone by the time this runs (e.g. a
+    # restore-network/remove-dns-entry call arriving after the network was
+    # already torn down). Starting apache2 against a nonexistent namespace
+    # always fails; treat it as a no-op, same as dnsmasq/haproxy above.
+    if ! ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b"; then
+        log "apache2: namespace ${NAMESPACE} no longer exists — skipping start/reload"
+        return 0
+    fi
     local bin; bin=$(_find_apache2_bin)
     local pid_f; pid_f=$(_apache2_pid)
 
@@ -1939,9 +2107,11 @@ _svc_start_or_reload_apache2() {
             log "WARNING: apache2 graceful restart failed"
     else
         log "apache2: starting in namespace ${NAMESPACE}"
-        if ! ip netns exec "${NAMESPACE}" "${bin}" -f "$(_apache2_conf)" -k start 2>/dev/null; then
+        local start_err
+        start_err=$(ip netns exec "${NAMESPACE}" "${bin}" -f "$(_apache2_conf)" -k start 2>&1) || {
+            log "apache2 start error: ${start_err}"
             die "apache2/httpd failed to start — check $(_apache2_conf) and ${LOG_FILE} for details"
-        fi
+        }
     fi
 
     # Allow metadata traffic inbound to the namespace (INPUT) from guest subnet only.
