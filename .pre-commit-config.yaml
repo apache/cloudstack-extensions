@@ -14,32 +14,15 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-# https://cwiki.apache.org/confluence/display/INFRA/git+-+.asf.yaml+features
-github:
-  description: "Extensions for Apache CloudStack"
-  homepage: https://cloudstack.apache.org/
-  labels:
-    - cloudstack
-    - extension
-
-  features:
-    issues: true
-
-  enabled_merge_buttons:
-    merge: false
-    squash: true
-    rebase: false
-    
-  rulesets:
-    - name: "Default Branch Protection"
-      type: branch
-      branches:
-        includes:
-          - "~DEFAULT_BRANCH"
-        excludes: []
-      bypass_teams:
-        - root
-
-      restrict_deletion: true
-      restrict_force_push: false
+---
+default_stages: [pre-commit, pre-push]
+default_language_version:
+  # force all unspecified Python hooks to run python3
+  python: python3
+minimum_pre_commit_version: "3.2.0"
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
