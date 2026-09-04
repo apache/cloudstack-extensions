@@ -41,9 +41,5 @@ github:
       bypass_teams:
         - root
 
-      required_status_checks:
-        - name: "Run pre-commit"
-          app_slug: "github-actions"
-
       restrict_deletion: true
       restrict_force_push: false
