@@ -46,5 +46,9 @@ github:
         require_code_owner_reviews: false
         required_approving_review_count: 0
 
+      required_status_checks:
+        - name: "Run pre-commit"
+          app_slug: "github-actions"
+
       restrict_deletion: true
       restrict_force_push: false
