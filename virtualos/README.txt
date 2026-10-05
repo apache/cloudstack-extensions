@@ -31,8 +31,8 @@ default passed as launch argument:
   open -n -g -a virtualOS --args -autostartVMBundlePath <dir>/<name>.bundle
 
 Each running instance is one virtualOS process; stopping an instance
-terminates that process. The script runs on the management server and
-reaches the Mac through SSH. When the management server itself runs on the
+terminates that process. The extension is a Rust program that runs on the
+management server and reaches the Mac through SSH. When the management server itself runs on the
 Mac (e.g. a development setup), the host url can be "localhost" and no SSH
 is used.
 
@@ -40,8 +40,12 @@ Requirements
 ------------
 
 Management server:
-  - python3 (standard library only)
+  - The virtualos binary built for the management server's platform (see
+    Building); it has no runtime dependencies besides the C library
   - ssh client; sshpass only when password authentication is used
+
+Building:
+  - A current stable Rust toolchain with cargo (https://rustup.rs)
 
 Mac:
   - Apple silicon, virtualOS 3.0 or later (the autostart setting is used)
@@ -103,19 +107,26 @@ Setup
 1. In virtualOS, install a macOS VM to use as template, e.g. "macOS-15".
    Set it up as wanted (user account, Remote Login, ...) and shut it down.
 
-2. Copy virtualos.py to every management server:
+2. Build the binary on (or for) the management server's platform, e.g. on
+   a Linux management server:
+
+     cargo build --release
+
+   and copy it to every management server:
 
      mkdir -p /usr/share/cloudstack-management/extensions/virtualOS
-     cp virtualos.py /usr/share/cloudstack-management/extensions/virtualOS/virtualos.py
-     chmod 755 /usr/share/cloudstack-management/extensions/virtualOS/virtualos.py
+     cp target/release/virtualos /usr/share/cloudstack-management/extensions/virtualOS/virtualos
+     chmod 755 /usr/share/cloudstack-management/extensions/virtualOS/virtualos
      chown -R cloud:cloud /usr/share/cloudstack-management/extensions/virtualOS
+
+   The unit tests run with "cargo test".
 
    For SSH key authentication, create a key for the cloud user and add the
    public key to ~/.ssh/authorized_keys of the user on the Mac.
 
 3. Register the extension and its custom action (CloudMonkey):
 
-     cmk create extension name=virtualOS type=Orchestrator path=virtualos.py
+     cmk create extension name=virtualOS type=Orchestrator path=virtualos
      cmk add customaction extensionid=<id> name=GetIpAddresses resourcetype=VirtualMachine
 
 4. Create a cluster with hypervisor External, register the extension to it,
