@@ -49,6 +49,8 @@
 //!                         instance, otherwise the template's mode is kept
 //!   bridge_interface      optional, macOS interface for bridged mode, e.g. en0
 //!   wait_timeout          optional, seconds to wait for state changes (120)
+//!   start_in_background   optional, "true" to launch virtualOS without
+//!                         bringing its window to the front (default "false")
 //!
 //! Instance/template details:
 //!   template_name         VM bundle to clone, overrides the host/extension value
@@ -69,7 +71,8 @@ const AUTOSTART_ARGUMENT: &str = "-autostartVMBundlePath";
 const LOCAL_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 const DHCP_LEASES: &str = "/var/db/dhcpd_leases";
 const REQUIRED_BUNDLE_FILES: [&str; 3] = ["HardwareModel", "AuxiliaryStorage", "Parameters.txt"];
-const START_CHECK_DELAY: Duration = Duration::from_secs(5);
+const VM_STARTED_MESSAGE: &str = "vm started";
+const START_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -188,6 +191,7 @@ struct Config {
     network_mode: String,
     bridge_interface: String,
     wait_timeout: u64,
+    start_in_background: bool,
     template_name: String,
     local: bool,
     vmname: String,
@@ -251,6 +255,7 @@ impl Config {
             ssh_key: detail("ssh_key", ""),
             ssh_port: detail("ssh_port", "22"),
             verify_host_key: flag("verify_host_key", "true"),
+            start_in_background: flag("start_in_background", "false"),
             app_path: detail("app_path", ""),
             vm_directory: detail("vm_directory", &default_vm_directory()).trim_end_matches('/').to_string(),
             network_mode,
@@ -495,26 +500,58 @@ impl VirtualOSManager {
         self.write_file(&format!("{bundle}/Parameters.txt"), content.as_bytes())
     }
 
-    fn start_errors(&self, pid: &str) -> Result<Vec<String>> {
+    /// Messages virtualOS logged for the given process, oldest first.
+    fn virtualos_messages(&self, pid: &str) -> Result<Vec<String>> {
         let predicate = format!("subsystem == \"{VIRTUALOS_LOG_SUBSYSTEM}\" AND processID == {pid}");
-        let output = self.run(&["/usr/bin/log", "show", "--last", "2m", "--style", "compact", "--predicate", &predicate])?;
-        let mut errors: Vec<String> = Vec::new();
-        for line in output.lines().filter(|l| l.contains("] Error")) {
-            let error = line.rsplit_once("] ").map(|(_, e)| e.to_string()).unwrap_or_default();
-            if !errors.contains(&error) {
-                errors.push(error);
+        let output = self.run(&["/usr/bin/log", "show", "--last", "5m", "--style", "compact", "--predicate", &predicate])?;
+        let mut messages: Vec<String> = Vec::new();
+        for line in output.lines().filter(|l| l.contains(&format!("[{VIRTUALOS_LOG_SUBSYSTEM}:"))) {
+            let message = line.rsplit_once("] ").map(|(_, m)| m.trim().to_string()).unwrap_or_default();
+            if !messages.contains(&message) {
+                messages.push(message);
             }
         }
-        Ok(errors)
+        Ok(messages)
+    }
+
+    /// Wait until virtualOS logs that the VM started; the failure reason is often redacted as <private>.
+    fn wait_for_vm_started(&mut self, pid: &str) -> Result<()> {
+        let vmname = self.config.vmname.clone();
+        let deadline = Instant::now() + START_CHECK_TIMEOUT;
+        let mut messages = Vec::new();
+        loop {
+            if let Ok(logged) = self.virtualos_messages(pid) {
+                messages = logged;
+            }
+            if messages.iter().any(|m| m == VM_STARTED_MESSAGE) {
+                return Ok(());
+            }
+            let errors: Vec<&String> = messages.iter().filter(|m| m.starts_with("Error")).collect();
+            if !errors.is_empty() || !self.vm_pids(None)?.contains(&pid.to_string()) || Instant::now() > deadline {
+                let reason = if errors.is_empty() { messages.join("; ") } else { errors.iter().map(|e| e.as_str()).collect::<Vec<_>>().join("; ") };
+                self.stop_vm(None)?;
+                return Err(format!("virtualOS did not start {vmname}: {reason}"));
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
     }
 
     fn start_vm(&mut self) -> Result<()> {
-        if !self.vm_pids(None)?.is_empty() {
-            return Ok(());
-        }
         let bundle = self.bundle_path(None)?;
+        if !self.vm_pids(None)?.is_empty() {
+            if !self.bundle_holders(&bundle)?.is_empty() {
+                return Ok(());
+            }
+            // the guest shut itself down, the virtualOS window stays open: close it before starting again
+            self.stop_vm(None)?;
+        }
         let app = self.app_path()?;
-        self.run(&["open", "-n", "-g", "-a", &app, "--args", AUTOSTART_ARGUMENT, &bundle])?;
+        let mut open = vec!["open", "-n"];
+        if self.config.start_in_background {
+            open.push("-g");
+        }
+        open.extend(["-a", &app, "--args", AUTOSTART_ARGUMENT, &bundle]);
+        self.run(&open)?;
         let vmname = self.config.vmname.clone();
         let deadline = Instant::now() + Duration::from_secs(self.config.wait_timeout);
         while self.vm_pids(None)?.is_empty() {
@@ -523,17 +560,12 @@ impl VirtualOSManager {
             }
             thread::sleep(Duration::from_secs(1));
         }
-        thread::sleep(START_CHECK_DELAY);
         let pids = self.vm_pids(None)?;
         let Some(pid) = pids.first() else {
             return Err(format!("virtualOS exited while starting {vmname}"));
         };
-        let errors = self.start_errors(pid).unwrap_or_default();
-        if !errors.is_empty() {
-            self.stop_vm(None)?;
-            return Err(format!("virtualOS failed to start {vmname}: {}", errors.join("; ")));
-        }
-        Ok(())
+        let pid = pid.clone();
+        self.wait_for_vm_started(&pid)
     }
 
     fn kill(&self, signal: &str, pids: &[String]) -> Result<()> {
@@ -564,7 +596,33 @@ impl VirtualOSManager {
         if !self.vm_pids(name)?.is_empty() {
             return Err(format!("Failed to stop {}", name.unwrap_or(&self.config.vmname)));
         }
-        Ok(())
+        self.wait_for_bundle_release(name)
+    }
+
+    /// The Virtualization framework's VM process can keep the disk open after virtualOS exits;
+    /// starting the VM again before it lets go fails.
+    fn wait_for_bundle_release(&mut self, name: Option<&str>) -> Result<()> {
+        let bundle = self.bundle_path(name)?;
+        let deadline = Instant::now() + Duration::from_secs(self.config.wait_timeout);
+        loop {
+            let holders = self.bundle_holders(&bundle)?;
+            if holders.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!("{bundle} is still in use by process(es) {}", holders.join(", ")));
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Pids of the processes holding files of the bundle open; while the guest runs, that is the
+    /// Virtualization framework's VM process.
+    fn bundle_holders(&self, bundle: &str) -> Result<Vec<String>> {
+        let output = self.sh("lsof -t +d \"$1\" 2>/dev/null; exit 0", &[bundle])?;
+        let mut pids: Vec<String> = output.split_whitespace().map(String::from).collect();
+        pids.dedup();
+        Ok(pids)
     }
 
     fn remove_bundle(&mut self) -> Result<()> {
@@ -627,8 +685,19 @@ impl VirtualOSManager {
         if !self.bundle_exists()? {
             return Err(self.bundle_not_found()?);
         }
+        self.apply_offering()?;
         self.start_vm()?;
         Ok(success_message("Instance started"))
+    }
+
+    /// Write the instance's current CPU count, memory and MAC address to a stopped VM,
+    /// so changed service offerings take effect on the next start.
+    fn apply_offering(&mut self) -> Result<()> {
+        if self.config.cpus.is_none() || self.config.memory.is_none() || !self.vm_pids(None)?.is_empty() {
+            return Ok(());
+        }
+        let bundle = self.bundle_path(None)?;
+        self.configure(&bundle)
     }
 
     fn stop(&mut self) -> Result<Value> {
@@ -640,6 +709,7 @@ impl VirtualOSManager {
     fn reboot(&mut self) -> Result<Value> {
         self.require_vmname()?;
         self.stop_vm(None)?;
+        self.apply_offering()?;
         self.start_vm()?;
         Ok(success_message("Instance rebooted"))
     }
@@ -653,9 +723,11 @@ impl VirtualOSManager {
         Ok(success_message("Instance deleted"))
     }
 
+    /// Running means a virtualOS process was started for the bundle and its guest still holds the
+    /// bundle's files; after a shutdown from inside the guest the virtualOS window stays open.
     fn power_state(&mut self, name: &str, running: &BTreeMap<String, Vec<String>>) -> Result<&'static str> {
         let bundle = self.bundle_path(Some(name))?;
-        Ok(if running.contains_key(&bundle) { "poweron" } else { "poweroff" })
+        Ok(if running.contains_key(&bundle) && !self.bundle_holders(&bundle)?.is_empty() { "poweron" } else { "poweroff" })
     }
 
     fn status(&mut self) -> Result<Value> {

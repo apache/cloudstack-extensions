@@ -65,9 +65,15 @@ Supported operations
                   GiB), MAC address and network mode, then start it. The
                   clone is removed again when any step fails.
   start, stop, reboot, delete, status, statuses
-                  start waits a few seconds and fails when virtualOS logs
-                  an error for the VM; stop terminates the virtualOS
-                  process, which powers the guest off without a shutdown
+                  start and reboot first write the instance's current CPU
+                  count, memory and MAC address to the VM, so a changed
+                  service offering takes effect;
+                  start succeeds once virtualOS logs "vm started" for the
+                  VM and fails (stopping the process again) when it logs
+                  anything else or exits; stop terminates the virtualOS
+                  process, which powers the guest off without a shutdown,
+                  and waits until no process holds the bundle's files, so
+                  reboot can start it again right away
   getconsole      Not supported, virtualOS has no VNC endpoint to hand out.
 
 Custom actions (register them with addCustomAction):
@@ -97,6 +103,9 @@ Extension or host details (host details win):
   bridge_interface  macOS interface for bridged mode, e.g. en0, or its
                     virtualOS name, e.g. "Wi-Fi (en0)"
   wait_timeout      Optional, seconds to wait for state changes, default 120
+  start_in_background
+                    Optional, "true" to launch virtualOS without bringing
+                    its window to the front, default "false"
 
 Template, service offering or instance details:
   template_name     VM bundle to clone, overrides the host/extension value
@@ -150,16 +159,17 @@ Limitations
   - Apple's macOS license and the Virtualization framework allow at most
     two macOS VMs running at the same time per Mac.
   - No graceful shutdown: stop and reboot power the guest off.
-  - Status is derived from the virtualOS process. When the guest shuts
-    itself down, its virtualOS process keeps running and the instance is
-    still reported as running until it is stopped from CloudStack. VMs
-    started from the virtualOS window are not seen at all.
+  - Status is derived from the virtualOS process together with the files
+    of the VM bundle being in use, so a shutdown from inside the guest is
+    reported as stopped even though its virtualOS window stays open; a
+    later start closes that window first. VMs started from a virtualOS
+    window instead of from CloudStack are not seen as running.
   - No console access, no root disk resizing and no snapshot support;
     virtualOS 3.0 only offers snapshots through its window.
   - The bundle name equals the CloudStack internal instance name; renaming
     the VM in virtualOS breaks the mapping.
-  - Tested on macOS 26.6 with virtualOS 3.0 without an installed macOS
-    guest: launching through the autostart argument, the start error
-    detection with an invalid bundle, cloning, machine identifier and
-    Parameters.txt generation, DHCP lease parsing, status, statuses and
-    delete. Running a real macOS guest still needs verification.
+  - Tested on macOS 26.6 with virtualOS 3.0 and a macOS 26.6.2 guest
+    through a CloudStack 24.0.0 management server: deploy (clone with new
+    machine identifier, CPU, memory and MAC), GetIpAddresses, stop, start,
+    reboot and destroy with expunge. Templates must be registered with
+    format EXTERNAL.
