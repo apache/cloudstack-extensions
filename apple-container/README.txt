@@ -57,12 +57,19 @@ Supported operations
                   count, memory (rounded up to whole MiB), one network
                   attachment per NIC with the CloudStack MAC address, then
                   start it. The container is removed again when it fails
-                  to start.
+                  to start. See Networks for which network each NIC uses.
   start, stop, reboot, delete, status, statuses
                   stop sends SIGTERM and kills the container after
                   wait_timeout seconds; statuses reports only containers
-                  carrying the CloudStack label
+                  carrying the CloudStack label. Containers stop together
+                  with the container system service, so when the service is
+                  not running it is started first (see start_service) and
+                  its containers are reported as stopped, instead of
+                  CloudStack seeing an unknown power state.
   getconsole      Not supported, Apple container has no VNC endpoint.
+                  Other operations CloudStack passes through, such as its
+                  periodic GetVmIpAddressCommand, are answered with
+                  "Operation not supported".
 
 Custom actions (register them with addCustomAction):
   GetIpAddresses  List the IPv4/IPv6 addresses of the instance's network
@@ -86,10 +93,13 @@ Extension or host details (host details win):
   network           Optional, comma separated container networks, one per
                     NIC in device order; the last one is used for further
                     NICs. Default: default. Create other networks with
-                    "container network create <name>".
+                    "container network create <name>". Not used for NICs on
+                    vmnet extension networks (see Networks).
   wait_timeout      Optional, seconds a stop waits before killing the
                     container, and the limit for other commands, default 60
   pull_timeout      Optional, seconds an image pull may take, default 900
+  start_service     Optional, "true" (default) starts the container system
+                    service when a command finds it not running
 
 Template, service offering or instance details (instance details win; they
 can also be set on the host or extension as defaults):
@@ -101,6 +111,26 @@ can also be set on the host or extension as defaults):
                     that reaps zombies and forwards signals
   rosetta           Optional, "true" enables Rosetta, for linux/amd64 images
 
+Networks
+--------
+
+A NIC on a CloudStack network of the vmnet network extension (an L2 network
+whose broadcast URI looks like vs://cs-net-42?mode=nat, see the vmnet
+extension's README.txt) is attached to the container network of that name.
+That network gets one vmnet network per CloudStack network, so instances on
+different CloudStack networks are isolated from each other:
+
+  - It is created with "container network create", labelled
+    org.apache.cloudstack.managed=true and with --internal for mode
+    internal, before an instance using it is created, started or rebooted.
+    A network of that name not created by CloudStack is not used, and the
+    instance fails to deploy.
+  - It is deleted when an instance using it is deleted and no other
+    container uses it any more.
+
+Any other NIC uses the network detail: the container network at its
+position in the list, the last one for further NICs.
+
 Setup
 -----
 
@@ -108,6 +138,31 @@ Setup
    user CloudStack will connect as:
 
      container system start --enable-kernel-install
+
+   The service does not start again by itself after a reboot or logout.
+   The extension starts it when it finds it down, but only once CloudStack
+   asks for a status (about once a minute), and starting it over SSH is not
+   verified yet. To start it at login instead, create a launchd
+   agent ~/Library/LaunchAgents/org.apache.cloudstack.container.plist:
+
+     <?xml version="1.0" encoding="UTF-8"?>
+     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+     <plist version="1.0">
+     <dict>
+       <key>Label</key><string>org.apache.cloudstack.container</string>
+       <key>ProgramArguments</key>
+       <array>
+         <string>/usr/local/bin/container</string>
+         <string>system</string>
+         <string>start</string>
+         <string>--disable-kernel-install</string>
+       </array>
+       <key>RunAtLoad</key><true/>
+     </dict>
+     </plist>
+
+   and load it with: launchctl load ~/Library/LaunchAgents/org.apache.cloudstack.container.plist
 
 2. Build the binary on (or for) the management server's platform, e.g. on
    a Linux management server:
@@ -151,7 +206,8 @@ Limitations
     running command, a command detail such as "sleep infinity", or an image
     with an init system.
   - Networking is limited to container (vmnet) networks on the Mac: no VLAN
-    isolation, and CloudStack does not manage the IP addresses. Apple
+    isolation, only networks of the vmnet network extension or ones
+    created by hand, and CloudStack does not manage the IP addresses. Apple
     container assigns them, possibly a different IPv4 address on every
     start; GetIpAddresses reports the current ones. The IPv6 address is
     derived from the MAC address and stays the same.
@@ -163,5 +219,8 @@ Limitations
   - Tested on macOS 26.6 with Apple container 1.5.0, locally (url
     localhost): deploy, stop, start, reboot and destroy from CloudStack,
     the CloudStack MAC address inside the guest, GetIpAddresses and GetLogs
-    with alpine:3.22 and command "sleep infinity". SSH to a remote Mac and
-    multiple NICs still need verification.
+    with alpine:3.22 and command "sleep infinity"; and with a vmnet
+    extension network in mode internal: two instances reach each other but
+    not the internet, the network is created with the first instance and
+    deleted with the last. SSH to a remote Mac and multiple NICs still need
+    verification.

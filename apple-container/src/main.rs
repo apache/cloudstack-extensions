@@ -26,7 +26,11 @@
 //!
 //! The management server reaches the Mac over SSH (or runs locally when the
 //! management server itself runs on the Mac). Each NIC of the instance is
-//! attached to a container network with the CloudStack MAC address.
+//! attached to a container network with the CloudStack MAC address. A NIC on
+//! a network of the vmnet network extension carries a broadcast URI such as
+//! vs://cs-net-42?mode=nat; it is attached to the container network of that
+//! name, which is created on first use and deleted with its last container.
+//! Other NICs use the networks of the network detail.
 //!
 //! Details (host details override extension details):
 //!   url                   Mac hostname/IP, or "localhost" to run locally
@@ -39,10 +43,13 @@
 //!   container_path        optional, defaults to /usr/local/bin/container
 //!   network               optional, comma separated container networks, one
 //!                         per NIC in device order, the last one repeating for
-//!                         further NICs; defaults to "default"
+//!                         further NICs; defaults to "default". Not used for
+//!                         NICs on vmnet extension networks
 //!   wait_timeout          optional, seconds a stop waits before the container
 //!                         is killed and to wait for other commands (60)
 //!   pull_timeout          optional, seconds to wait for an image pull (900)
+//!   start_service         optional, "true" (default) starts the container
+//!                         system service when it is not running
 //!
 //! Template, service offering or instance details (instance wins), which may
 //! also be set on the host or extension as defaults:
@@ -68,6 +75,13 @@ const DEFAULT_NETWORK: &str = "default";
 const MANAGED_LABEL: &str = "org.apache.cloudstack.managed";
 const LOCAL_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 const DEFAULT_LOG_LINES: u64 = 100;
+/// Broadcast URI scheme of the networks named by the vmnet network extension.
+const VMNET_SCHEME: &str = "vs://";
+/// Hint the container tool prints when its system service is not running.
+const SERVICE_DOWN_HINT: &str = "container system start";
+const OPERATIONS: [&str; 10] = [
+    "create", "start", "stop", "reboot", "delete", "status", "statuses", "getconsole", "getipaddresses", "getlogs",
+];
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -107,6 +121,37 @@ fn memory_argument(bytes: u64) -> String {
     format!("{}M", bytes.div_ceil(1024 * 1024).max(1))
 }
 
+/// A container network named by the vmnet network extension.
+#[derive(Clone, Debug, PartialEq)]
+struct VmnetNetwork {
+    name: String,
+    internal: bool,
+}
+
+/// The vmnet network of a NIC broadcast URI like vs://cs-net-42?mode=internal,
+/// or None for NICs on other networks.
+fn vmnet_network(broadcast_uri: &str) -> Result<Option<VmnetNetwork>> {
+    let Some(rest) = broadcast_uri.strip_prefix(VMNET_SCHEME) else {
+        return Ok(None);
+    };
+    let (name, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("Invalid vmnet network name in broadcast URI '{broadcast_uri}'"));
+    }
+    let mode = query.split('&').find_map(|p| p.strip_prefix("mode=")).unwrap_or("nat");
+    let internal = match mode {
+        "nat" => false,
+        "internal" => true,
+        _ => return Err(format!("Invalid vmnet network mode in broadcast URI '{broadcast_uri}'")),
+    };
+    Ok(Some(VmnetNetwork { name: name.to_string(), internal }))
+}
+
+struct Nic {
+    mac: String,
+    vmnet: Option<VmnetNetwork>,
+}
+
 /// The container network for each NIC, the last configured network repeating for further NICs.
 fn nic_networks(networks: &[String], nic_count: usize) -> Vec<String> {
     let last = networks.last().cloned().unwrap_or_else(|| DEFAULT_NETWORK.to_string());
@@ -131,10 +176,30 @@ fn container_networks(snapshot: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Names of the networks a container is attached to, running or not; only
+/// running containers report their network status.
+fn network_names(snapshot: &Value) -> Vec<String> {
+    let configured = snapshot
+        .get("configuration")
+        .and_then(|c| c.get("networks"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut names: Vec<String> = Vec::new();
+    for network in configured.iter().chain(container_networks(snapshot).iter()) {
+        let name = value_text(network.get("network"));
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn container_id(snapshot: &Value) -> String {
     value_text(snapshot.get("configuration").and_then(|c| c.get("id")))
 }
 
+/// Whether a container or network carries the CloudStack label.
 fn is_managed(snapshot: &Value) -> bool {
     snapshot
         .get("configuration")
@@ -179,6 +244,7 @@ struct Config {
     networks: Vec<String>,
     wait_timeout: u64,
     pull_timeout: u64,
+    start_service: bool,
     image: String,
     command: Vec<String>,
     platform: String,
@@ -187,7 +253,7 @@ struct Config {
     vmname: String,
     cpus: Option<u64>,
     memory: Option<u64>,
-    macs: Vec<String>,
+    nics: Vec<Nic>,
     parameters: Map<String, Value>,
 }
 
@@ -231,11 +297,15 @@ impl Config {
         let vm_details = section(json_data.get("cloudstack.vm.details"));
         let mut nics: Vec<&Value> = vm_details.get("nics").and_then(Value::as_array).map(|n| n.iter().collect()).unwrap_or_default();
         nics.sort_by_key(|nic| nic.get("deviceId").and_then(Value::as_i64).unwrap_or(0));
-        let macs = nics
+        let nics = nics
             .iter()
-            .map(|nic| value_text(nic.get("mac")))
-            .filter(|mac| !mac.is_empty())
-            .collect();
+            .map(|nic| {
+                Ok(Nic {
+                    mac: value_text(nic.get("mac")),
+                    vmnet: vmnet_network(&value_text(nic.get("broadcastUri")))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Config {
             url,
@@ -249,6 +319,7 @@ impl Config {
             networks,
             wait_timeout: number("wait_timeout", "60")?,
             pull_timeout: number("pull_timeout", "900")?,
+            start_service: detail("start_service", "true").to_lowercase() == "true",
             image: vm_detail("image", ""),
             command: vm_detail("command", "").split_whitespace().map(String::from).collect(),
             platform: vm_detail("platform", ""),
@@ -257,7 +328,7 @@ impl Config {
             vmname: value_text(vm_details.get("name")),
             cpus: value_u64(vm_details.get("cpus")),
             memory: value_u64(vm_details.get("minRam")),
-            macs,
+            nics,
             parameters: section(json_data.get("parameters")),
         })
     }
@@ -350,9 +421,26 @@ impl ContainerManager {
         Ok(())
     }
 
-    /// All containers, running or not, keyed by container ID.
+    /// Start the container system service, without installing a kernel as that prompts.
+    fn start_service(&self) -> Result<()> {
+        let timeout = self.config.wait_timeout.to_string();
+        self.container(&["system", "start", "--disable-kernel-install", "--timeout", &timeout])
+            .map(|_| ())
+            .map_err(|e| format!("The container system service is not running and failed to start: {e}"))
+    }
+
+    /// All containers, running or not, keyed by container ID. Containers do
+    /// not survive the system service, so when it is down it is started to
+    /// report them as stopped instead of failing.
     fn list_containers(&self) -> Result<BTreeMap<String, Value>> {
-        let output = self.container(&["list", "--all", "--format", "json"])?;
+        let args = ["list", "--all", "--format", "json"];
+        let output = match self.container(&args) {
+            Err(e) if self.config.start_service && e.contains(SERVICE_DOWN_HINT) => {
+                self.start_service()?;
+                self.container(&args)?
+            }
+            result => result?,
+        };
         let containers: Value = serde_json::from_str(output.trim())
             .map_err(|e| format!("Failed to parse the container list: {e}"))?;
         Ok(containers
@@ -380,10 +468,12 @@ impl ContainerManager {
         if let Some(memory) = c.memory {
             args.extend(["--memory".to_string(), memory_argument(memory)]);
         }
-        let networks = nic_networks(&c.networks, c.macs.len());
+        let networks = nic_networks(&c.networks, c.nics.len());
         for (i, network) in networks.iter().enumerate() {
-            let spec = match c.macs.get(i) {
-                Some(mac) => format!("{network},mac={}", mac.to_lowercase()),
+            let nic = c.nics.get(i);
+            let network = nic.and_then(|n| n.vmnet.as_ref()).map(|v| &v.name).unwrap_or(network);
+            let spec = match nic.filter(|n| !n.mac.is_empty()) {
+                Some(nic) => format!("{network},mac={}", nic.mac.to_lowercase()),
                 None => network.clone(),
             };
             args.extend(["--network".to_string(), spec]);
@@ -400,6 +490,75 @@ impl ContainerManager {
         args.push(c.image.clone());
         args.extend(c.command.iter().cloned());
         args
+    }
+
+    /// The distinct vmnet extension networks of the instance's NICs.
+    fn vmnet_networks(&self) -> Vec<&VmnetNetwork> {
+        let mut networks: Vec<&VmnetNetwork> = Vec::new();
+        for network in self.config.nics.iter().filter_map(|n| n.vmnet.as_ref()) {
+            if !networks.iter().any(|n| n.name == network.name) {
+                networks.push(network);
+            }
+        }
+        networks
+    }
+
+    /// All container networks keyed by name.
+    fn list_networks(&self) -> Result<BTreeMap<String, Value>> {
+        let output = self.container(&["network", "list", "--format", "json"])?;
+        let networks: Value = serde_json::from_str(output.trim())
+            .map_err(|e| format!("Failed to parse the network list: {e}"))?;
+        Ok(networks
+            .as_array()
+            .map(|list| list.iter().map(|n| (value_text(n.get("id")), n.clone())).collect())
+            .unwrap_or_default())
+    }
+
+    /// Create the vmnet extension networks the instance needs and that do not
+    /// exist yet. An existing network is only used when CloudStack created it.
+    fn ensure_networks(&self) -> Result<()> {
+        let wanted = self.vmnet_networks();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let existing = self.list_networks()?;
+        for network in wanted {
+            match existing.get(&network.name) {
+                Some(found) if is_managed(found) => continue,
+                Some(_) => {
+                    return Err(format!("Container network '{}' exists but was not created by CloudStack", network.name))
+                }
+                None => {}
+            }
+            let label = format!("{MANAGED_LABEL}=true");
+            let mut args = vec!["network", "create", "--label", label.as_str()];
+            if network.internal {
+                args.push("--internal");
+            }
+            args.push(&network.name);
+            if let Err(e) = self.container(&args) {
+                // Another instance may have created it meanwhile.
+                if !self.list_networks()?.get(&network.name).is_some_and(is_managed) {
+                    return Err(format!("Failed to create container network '{}': {e}", network.name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete the given networks when CloudStack created them and no other
+    /// container uses them; the container tool refuses to delete networks in use.
+    fn delete_unused_networks(&self, names: &[String]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let existing = self.list_networks()?;
+        for name in names {
+            if existing.get(name).is_some_and(is_managed) {
+                let _ = self.container(&["network", "delete", name]);
+            }
+        }
+        Ok(())
     }
 
     fn pull_image(&self) -> Result<()> {
@@ -440,6 +599,7 @@ impl ContainerManager {
             return Err(format!("A container named '{name}' already exists"));
         }
         self.pull_image()?;
+        self.ensure_networks()?;
         let args = self.create_arguments();
         self.container(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
         if let Err(e) = self.start_container() {
@@ -452,6 +612,7 @@ impl ContainerManager {
     fn start(&mut self) -> Result<Value> {
         self.require_vmname()?;
         if container_state(&self.require_container()?) != "running" {
+            self.ensure_networks()?;
             self.start_container()?;
         }
         Ok(success_message("Instance started"))
@@ -472,14 +633,19 @@ impl ContainerManager {
         if container_state(&self.require_container()?) != "stopped" {
             self.stop_container()?;
         }
+        self.ensure_networks()?;
         self.start_container()?;
         Ok(success_message("Instance rebooted"))
     }
 
     fn delete(&mut self) -> Result<Value> {
         self.require_vmname()?;
-        if self.find_container()?.is_some() {
+        if let Some(snapshot) = self.find_container()? {
+            // The expunge payload has no NICs, so take the networks from the container.
+            let networks = network_names(&snapshot);
             self.delete_container()?;
+            // Best effort: a leftover network is reused or deleted with a later instance.
+            let _ = self.delete_unused_networks(&networks);
         }
         Ok(success_message("Instance deleted"))
     }
@@ -523,6 +689,11 @@ impl ContainerManager {
 }
 
 fn execute(operation: &str, json_file_path: &str) -> Result<Value> {
+    // CloudStack also passes commands it has no extension operation for, such as
+    // com.cloud.agent.api.GetVmIpAddressCommand, without host details.
+    if !OPERATIONS.contains(&operation) {
+        return Err(format!("Operation not supported: {operation}"));
+    }
     let content = fs::read_to_string(json_file_path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!("JSON file not found: {json_file_path}"),
         _ => format!("Failed to read {json_file_path}: {e}"),
@@ -541,7 +712,7 @@ fn execute(operation: &str, json_file_path: &str) -> Result<Value> {
         "getconsole" => Err("Operation not supported".into()),
         "getipaddresses" => manager.get_ip_addresses(),
         "getlogs" => manager.get_logs(),
-        _ => Err("Invalid action".into()),
+        _ => unreachable!("operation {operation} is checked above"),
     }
 }
 
@@ -613,11 +784,14 @@ mod tests {
         assert!(c.local);
         assert_eq!(c.container_path, DEFAULT_CONTAINER_PATH);
         assert_eq!(c.networks, vec!["default", "isolated"]);
-        assert_eq!(c.macs, vec!["02:00:0a:00:00:01", "02:00:0A:00:00:02", "02:00:0a:00:00:03"]);
+        let macs: Vec<&str> = c.nics.iter().map(|n| n.mac.as_str()).collect();
+        assert_eq!(macs, vec!["02:00:0a:00:00:01", "02:00:0A:00:00:02", "02:00:0a:00:00:03"]);
+        assert!(c.nics.iter().all(|n| n.vmnet.is_none()));
         assert_eq!(c.command, vec!["sleep", "infinity"]);
         assert!(c.init);
         assert!(!c.rosetta);
         assert_eq!(c.wait_timeout, 60);
+        assert!(c.start_service);
         assert!(Config::parse(&json!({"externaldetails": {"extension": {"url": "mac"}}})).is_err());
         assert!(Config::parse(&json!({"externaldetails": {"extension": {"url": "localhost", "wait_timeout": "x"}}})).is_err());
     }
@@ -651,12 +825,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_vmnet_broadcast_uris() {
+        let net = |name: &str, internal| Some(VmnetNetwork { name: name.into(), internal });
+        assert_eq!(vmnet_network("vs://cs-net-42?mode=nat").unwrap(), net("cs-net-42", false));
+        assert_eq!(vmnet_network("vs://cs-net-7?mode=internal").unwrap(), net("cs-net-7", true));
+        assert_eq!(vmnet_network("vs://cs-net-7").unwrap(), net("cs-net-7", false));
+        assert_eq!(vmnet_network("vlan://300").unwrap(), None);
+        assert_eq!(vmnet_network("").unwrap(), None);
+        assert!(vmnet_network("vs://cs-net-7?mode=bridged").is_err());
+        assert!(vmnet_network("vs://Bad_Name").is_err());
+        assert!(vmnet_network("vs://").is_err());
+    }
+
+    #[test]
+    fn attaches_vmnet_nics_to_their_own_networks() {
+        let mut data = base(json!({"image": "alpine:3.22"}));
+        data["cloudstack.vm.details"]["nics"] = json!([
+            {"deviceId": 0, "mac": "02:00:0a:00:00:01", "broadcastUri": "vs://cs-net-42?mode=internal"},
+            {"deviceId": 1, "mac": "02:00:0a:00:00:02", "broadcastUri": "vlan://300"},
+            {"deviceId": 2, "mac": "02:00:0a:00:00:03", "broadcastUri": "vs://cs-net-42?mode=internal"},
+        ]);
+        let manager = ContainerManager { config: config(data) };
+        assert_eq!(manager.vmnet_networks(), vec![&VmnetNetwork { name: "cs-net-42".into(), internal: true }]);
+        let args = manager.create_arguments();
+        let networks: Vec<&str> = args.iter().zip(args.iter().skip(1))
+            .filter(|(flag, _)| *flag == "--network").map(|(_, spec)| spec.as_str()).collect();
+        assert_eq!(networks, vec![
+            "cs-net-42,mac=02:00:0a:00:00:01", "isolated,mac=02:00:0a:00:00:02", "cs-net-42,mac=02:00:0a:00:00:03",
+        ]);
+    }
+
+    #[test]
     fn rejects_unsafe_instance_names() {
         let mut data = base(json!({}));
         for name in ["", "-rf", "../x", "a b"] {
             data["cloudstack.vm.details"]["name"] = json!(name);
             assert!(ContainerManager { config: config(data.clone()) }.require_vmname().is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn rejects_unsupported_operations_before_reading_details() {
+        let error = execute("com.cloud.agent.api.getvmipaddresscommand", "/nonexistent.json").unwrap_err();
+        assert_eq!(error, "Operation not supported: com.cloud.agent.api.getvmipaddresscommand");
+        assert!(execute("statuses", "/nonexistent.json").unwrap_err().starts_with("JSON file not found"));
     }
 
     #[test]
@@ -672,6 +884,13 @@ mod tests {
         assert_eq!(power_state(&container_state(&current)), "poweron");
         assert!(is_managed(&current));
         assert_eq!(ip_addresses(&current), vec!["192.168.64.3", "fd00::3"]);
+        assert_eq!(network_names(&current), vec!["default"]);
+        let stopped = json!({
+            "configuration": {"id": "i-2-11-VM", "networks": [{"network": "cs-net-42", "options": {}},
+                                                              {"network": "default", "options": {}}]},
+            "status": "stopped"
+        });
+        assert_eq!(network_names(&stopped), vec!["cs-net-42", "default"]);
 
         let legacy = json!({
             "configuration": {"id": "buildkit", "labels": {}},
