@@ -466,4 +466,3 @@ fi
 
 log "Command '${COMMAND}' completed successfully on ${REMOTE_HOST}"
 exit 0
-
