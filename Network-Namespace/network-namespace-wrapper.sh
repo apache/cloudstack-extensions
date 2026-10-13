@@ -456,14 +456,59 @@ ensure_host_bridge() {
     echo "${br}"
 }
 
-# _guard_ns_shutdown <caller-label>
-# When network_state is "shutdown" and the namespace is already gone, exit
-# successfully — the network has already been torn down on this host.
+# teardown_host_bridge_if_unused <eth> <vlan>
+# Counterpart to ensure_host_bridge(): removes the VLAN sub-interface (ethX.vlan)
+# and the bridge (br<eth>-<vlan>) it created, but ONLY if no VM (or other
+# consumer, e.g. another VPC tier/network/tenant riding the same public VLAN)
+# still has an interface plugged into the bridge.
+#
+# ensure_host_bridge() always enslaves the VLAN uplink (ethX.vlan) into the
+# bridge, so it is always present as a bridge member — it must be excluded
+# from the "is anything still using this bridge" check, otherwise the bridge
+# would never be considered unused.
+#
+# Safe to call unconditionally from any teardown path — it is a no-op
+# whenever the bridge is still in use (by a VM tap or otherwise), or already
+# gone.
+teardown_host_bridge_if_unused() {
+    local eth="$1" vlan_raw="$2" vlan br vif members
+    vlan=$(normalize_vlan "${vlan_raw}")
+    br=$(host_bridge_name "${eth}" "${vlan}")
+    vif="${eth}.${vlan}"
+
+    if ! ip link show "${br}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -d "/sys/class/net/${br}/brif" ]; then
+        members=$(ls -A "/sys/class/net/${br}/brif" 2>/dev/null | grep -v -x "${vif}" || true)
+        if [ -n "${members}" ]; then
+            log "teardown_host_bridge_if_unused: ${br} still has member interfaces (${members}), leaving in place"
+            return 0
+        fi
+    fi
+
+    ip link del "${br}" 2>/dev/null || true
+    log "Removed host bridge ${br}"
+
+    if ip link show "${vif}" >/dev/null 2>&1; then
+        ip link del "${vif}" 2>/dev/null || true
+        log "Removed VLAN interface ${vif}"
+    fi
+}
+
+# _guard_ns_teardown <caller-label>
+# When network_state is "shutdown", "destroy", or "allocated" and the namespace
+# is already gone, exit successfully — the network has been torn down or was
+# never implemented on this host.
 # Call this after acquire_lock in any command that does namespace operations.
-_guard_ns_shutdown() {
-    [ "${NETWORK_STATE:-}" = "shutdown" ] || return 0
+_guard_ns_teardown() {
+    case "${NETWORK_STATE:-}" in
+        shutdown|destroy|allocated) ;;
+        *) return 0 ;;
+    esac
     ip netns list 2>/dev/null | grep -q "^${NAMESPACE}\b" && return 0
-    log "${1:-command}: namespace ${NAMESPACE} not found (network_state=shutdown) — treating as success"
+    log "${1:-command}: namespace ${NAMESPACE} not found (network_state=${NETWORK_STATE}) — treating as success"
     release_lock
     exit 0
 }
@@ -526,6 +571,10 @@ parse_args() {
     FW_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.fw_rules")
     ACL_RULES_JSON=$(_payload_json_get "${payload_file}" "payload.acl_rules")
     NETWORK_STATE=$(_payload_json_get "${payload_file}" "payload.network_state")
+    NETWORK_IP6_GATEWAY=$(_payload_json_get "${payload_file}" "payload.network_ip6_gateway")
+    NETWORK_IP6_CIDR=$(_payload_json_get "${payload_file}" "payload.network_ip6_cidr")
+    DNS6_SERVER=$(_payload_json_get "${payload_file}" "payload.dns6")
+    NIC_IP6_ADDRESS=$(_payload_json_get "${payload_file}" "payload.ip6_address")
 
     [ -z "${SOURCE_NAT}" ] && SOURCE_NAT="false"
     [ -z "${LB_RULES_JSON}" ] && LB_RULES_JSON="[]"
@@ -578,10 +627,13 @@ _load_state() {
         done
     }
 
-    _read_sf VLAN        vlan        "${nsd}" "${old}"
-    _read_sf CIDR        cidr        "${nsd}" "${old}"
-    _read_sf GATEWAY     gateway     "${nsd}" "${old}"
-    _read_sf EXTENSION_IP extension-ip "${nsd}" "${old}"
+    _read_sf VLAN             vlan        "${nsd}" "${old}"
+    _read_sf CIDR             cidr        "${nsd}" "${old}"
+    _read_sf GATEWAY          gateway     "${nsd}" "${old}"
+    _read_sf EXTENSION_IP     extension-ip "${nsd}" "${old}"
+    _read_sf NETWORK_IP6_GATEWAY ip6-gateway "${nsd}" "${old}"
+    _read_sf NETWORK_IP6_CIDR    ip6-cidr    "${nsd}" "${old}"
+    _read_sf DNS6_SERVER         dns6        "${nsd}" "${old}"
 
     if [ -z "${NAMESPACE}" ]; then
         # Namespace is VPC-wide: check vpc state dir, then per-net, then legacy.
@@ -631,11 +683,17 @@ cmd_implement_network() {
     # Ensure per-namespace iproute2 rt_tables for PBR isolation
     _pbr_ensure_table_file
 
-    # Disable IPv6 inside the namespace to avoid IPv6 autoconf/link-local behavior
-    # Apply globally and to the default and loopback interfaces. Idempotent.
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+    # IPv6: enable when a guest IPv6 gateway is configured; otherwise disable
+    # globally for standalone networks (VPC tiers only disable per-interface to
+    # avoid clobbering IPv6 state set by sibling tiers in the same namespace).
+    if [ -n "${NETWORK_IP6_GATEWAY}" ]; then
+        _enable_ipv6_in_namespace "${veth_n}"
+        log "implement-network: IPv6 enabled in namespace ${NAMESPACE}"
+    elif [ -z "${VPC_ID}" ]; then
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1     >/dev/null 2>&1 || true
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1      >/dev/null 2>&1 || true
+    fi
 
     # ---- 2. Host bridge + VLAN sub-interface ----
     if [ -n "${VLAN}" ]; then
@@ -684,9 +742,22 @@ cmd_implement_network() {
         fi
     fi
 
-    # Disable IPv6 on the guest veth namespace interface to prevent IPv6 addresses
-    # from appearing on the interface (idempotent)
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".disable_ipv6=1 >/dev/null 2>&1 || true
+    # ---- 4b. Assign IPv6 gateway address to the guest veth ----
+    if [ -n "${NETWORK_IP6_GATEWAY}" ] && [ -n "${NETWORK_IP6_CIDR}" ]; then
+        local ip6_prefix
+        ip6_prefix=$(echo "${NETWORK_IP6_CIDR}" | cut -d'/' -f2)
+        ip netns exec "${NAMESPACE}" ip -6 addr show "${veth_n}" 2>/dev/null | \
+            grep -q "${NETWORK_IP6_GATEWAY}/" || \
+            ip netns exec "${NAMESPACE}" ip -6 addr add \
+                "${NETWORK_IP6_GATEWAY}/${ip6_prefix}" dev "${veth_n}" 2>/dev/null || true
+        log "implement-network: assigned IPv6 ${NETWORK_IP6_GATEWAY}/${ip6_prefix} to ${veth_n}"
+    else
+        # No IPv6 on this interface; disable per-interface to suppress link-local
+        # autoconf.  For VPC tiers skip global disable to avoid breaking sibling
+        # tiers that may have IPv6 enabled.
+        ip netns exec "${NAMESPACE}" sysctl -w \
+            net.ipv6.conf."${veth_n}".disable_ipv6=1 >/dev/null 2>&1 || true
+    fi
 
     if [ "${GUEST_TYPE}" = "isolated" ]; then
          # ---- 5. IP forwarding  (needed for Isolated networks only) ----
@@ -720,6 +791,15 @@ cmd_implement_network() {
     echo "${GATEWAY}" > "${nsd}/gateway"
     echo "${CIDR}"    > "${nsd}/cidr"
     echo "${ext_ip}"  > "${nsd}/extension-ip"
+    if [ -n "${NETWORK_IP6_GATEWAY}" ]; then
+        echo "${NETWORK_IP6_GATEWAY}" > "${nsd}/ip6-gateway"
+    fi
+    if [ -n "${NETWORK_IP6_CIDR}" ]; then
+        echo "${NETWORK_IP6_CIDR}" > "${nsd}/ip6-cidr"
+    fi
+    if [ -n "${DNS6_SERVER}" ]; then
+        echo "${DNS6_SERVER}" > "${nsd}/dns6"
+    fi
 
     # Namespace + VPC tier tracking → vpc-<vpcId>/ (or network-<networkId>/ for isolated)
     local vsd; vsd=$(_vpc_state_dir)
@@ -816,8 +896,9 @@ cmd_shutdown_network() {
         fi
     fi
 
-    # Stop per-network services (dnsmasq, haproxy, apache2, passwd-server)
+    # Stop per-network services (dnsmasq, radvd, haproxy, apache2, passwd-server)
     _svc_stop_dnsmasq
+    _svc_stop_radvd
     _svc_stop_haproxy
     _svc_stop_apache2
     _svc_stop_passwd_server
@@ -856,6 +937,13 @@ cmd_destroy_network() {
     veth_h=$(veth_host_name "${VLAN}" "${CHOSEN_ID}")
     ip link del "${veth_h}" 2>/dev/null || true
 
+    # The guest VLAN bridge/sub-interface (ensure_host_bridge) is where VM taps
+    # are plugged in directly by the hypervisor. Destroying a network implies
+    # no VMs remain on it, so it is safe to tear these down here (guarded by
+    # teardown_host_bridge_if_unused() in case anything unexpected is still
+    # attached).
+    teardown_host_bridge_if_unused "${GUEST_ETH}" "${VLAN}"
+
     local vsd; vsd=$(_vpc_state_dir)
 
     # Public veth pairs and their state files only exist for Isolated networks
@@ -880,12 +968,16 @@ cmd_destroy_network() {
                 pveth_h=$(pub_veth_host_name "${pvlan}" "${CHOSEN_ID}")
                 ip link del "${pveth_h}" 2>/dev/null || true
                 rm -f "${f}" "${f%.pvlan}" "${tier_f}" 2>/dev/null || true
+                # Public bridge may be shared by other tiers/networks/tenants on
+                # the same public VLAN; only removed once nothing else uses it.
+                teardown_host_bridge_if_unused "${PUB_ETH}" "${pvlan}"
             done
         fi
     fi
 
     # Stop per-network services before removing state
     _svc_stop_dnsmasq
+    _svc_stop_radvd
     _svc_stop_haproxy
     _svc_stop_apache2
     _svc_stop_passwd_server
@@ -924,7 +1016,7 @@ cmd_assign_ip() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    _guard_ns_shutdown "assign-ip"
+    _guard_ns_teardown "assign-ip"
     log "assign-ip: network=${NETWORK_ID} ns=${NAMESPACE} ip=${PUBLIC_IP} source_nat=${SOURCE_NAT}"
     [ -z "${PUBLIC_IP}" ]   && die "Missing --public-ip"
     [ -z "${PUBLIC_VLAN}" ] && die "Missing --public-vlan"
@@ -981,7 +1073,7 @@ cmd_assign_ip() {
             >/dev/null 2>&1 || true
         log "assign-ip: sent gratuitous ARP for ${PUBLIC_IP} on ${pveth_n}"
     else
-        log "assign-ip: arping not available — skipping gratuitous ARP for ${PUBLIC_IP}"
+        log "assign-ip: arping not found — skipping gratuitous ARP for ${PUBLIC_IP}"
     fi
 
     # ---- Default route inside namespace toward upstream gateway ----
@@ -1086,6 +1178,9 @@ cmd_release_ip() {
     if [ "${remaining}" -eq 0 ]; then
         ip link del "${pveth_h}" 2>/dev/null || true
         log "release-ip: removed public veth ${pveth_h}"
+        # Public bridge may still be shared by other networks/tenants on the
+        # same public VLAN; only removed once nothing else uses it.
+        teardown_host_bridge_if_unused "${PUB_ETH}" "${PUBLIC_VLAN}"
     fi
 
     # Remove default route if no IPs remain
@@ -1117,7 +1212,7 @@ cmd_add_static_nat() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    _guard_ns_shutdown "add-static-nat"
+    _guard_ns_teardown "add-static-nat"
     log "add-static-nat: network=${NETWORK_ID} ns=${NAMESPACE} ${PUBLIC_IP} <-> ${PRIVATE_IP}"
     [ -z "${PUBLIC_IP}" ]  && die "Missing --public-ip"
     [ -z "${PRIVATE_IP}" ] && die "Missing --private-ip"
@@ -1225,7 +1320,7 @@ cmd_add_port_forward() {
     _load_state
     acquire_lock "${NETWORK_ID}"
 
-    _guard_ns_shutdown "add-port-forward"
+    _guard_ns_teardown "add-port-forward"
     log "add-port-forward: network=${NETWORK_ID} ns=${NAMESPACE} ${PUBLIC_IP}:${PUBLIC_PORT} -> ${PRIVATE_IP}:${PRIVATE_PORT} (${PROTOCOL})"
     [ -z "${PUBLIC_IP}" ]    && die "Missing --public-ip"
     [ -z "${PUBLIC_PORT}" ]  && die "Missing --public-port"
@@ -1337,6 +1432,10 @@ _dnsmasq_hosts()      { echo "$(_net_state_dir)/dnsmasq/hosts"; }
 _dnsmasq_dhcp_hosts() { echo "$(_net_state_dir)/dnsmasq/dhcp-hosts"; }
 _dnsmasq_dhcp_opts()  { echo "$(_net_state_dir)/dnsmasq/dhcp-opts"; }
 
+_radvd_dir()  { echo "$(_net_state_dir)/radvd"; }
+_radvd_conf() { echo "$(_net_state_dir)/radvd/radvd.conf"; }
+_radvd_pid()  { echo "$(_net_state_dir)/radvd/radvd.pid"; }
+
 _haproxy_dir()  { echo "$(_net_state_dir)/haproxy"; }
 _haproxy_conf() { echo "$(_net_state_dir)/haproxy/haproxy.cfg"; }
 _haproxy_pid()  { echo "$(_net_state_dir)/haproxy/haproxy.pid"; }
@@ -1354,14 +1453,36 @@ _passwd_server_pid()    { echo "$(_net_state_dir)/passwd-server.pid"; }
 _passwd_server_script() { echo "$(_net_state_dir)/passwd-server.py"; }
 
 ##############################################################################
-# Helpers: binary detection
+# Helpers: binary detection and package checking
 ##############################################################################
 
+# _require_binary <binary> [<binary2> ...]
+# Checks that at least one of the given binaries is executable.
+# If none are found:
+#   - network_state is shutdown/destroy/allocated → log and exit 0 (the service
+#     was never running so there is nothing to clean up).
+#   - otherwise → die() with a clear error message.
+_require_binary() {
+    local bin
+    for bin in "$@"; do
+        if command -v "${bin}" >/dev/null 2>&1 || [ -x "${bin}" ]; then
+            return 0
+        fi
+    done
+    case "${NETWORK_STATE:-}" in
+        shutdown|destroy|allocated)
+            log "Required binary '$1' not found (network_state=${NETWORK_STATE}) — treating as success"
+            release_lock
+            exit 0 ;;
+    esac
+    die "Required binary '$1' not found on this host"
+}
+
 _find_apache2_bin() {
-    for bin in apache2 httpd /usr/sbin/apache2 /usr/sbin/httpd; do
+    for bin in apache2 httpd; do
         command -v "${bin}" >/dev/null 2>&1 && echo "${bin}" && return
     done
-    echo "apache2"
+    echo ""
 }
 
 _find_apache2_modules_dir() {
@@ -1423,6 +1544,7 @@ _write_dnsmasq_conf() {
 # Auto-generated by network-namespace-wrapper.sh — do not edit
 ${port_line}
 interface=${veth_n}
+except-interface=lo
 #no-hosts
 bind-interfaces
 localise-queries
@@ -1447,6 +1569,7 @@ EOF
 }
 
 _svc_start_or_reload_dnsmasq() {
+    _require_binary dnsmasq
     local pid_f; pid_f=$(_dnsmasq_pid)
     if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
         log "dnsmasq: sending SIGHUP to reload (pid=$(cat "${pid_f}"))"
@@ -1454,7 +1577,7 @@ _svc_start_or_reload_dnsmasq() {
     else
         log "dnsmasq: starting in namespace ${NAMESPACE}"
         if ! ip netns exec "${NAMESPACE}" dnsmasq --conf-file="$(_dnsmasq_conf)"; then
-            log "WARNING: dnsmasq start failed — is dnsmasq installed on this host?"
+            die "dnsmasq failed to start — check $(_dnsmasq_conf) and ${LOG_FILE} for details"
         fi
     fi
 }
@@ -1469,6 +1592,111 @@ _svc_stop_dnsmasq() {
     fi
     # Kill any orphaned dnsmasq for this network
     pkill -f "dnsmasq.*${NETWORK_ID}" 2>/dev/null || true
+}
+
+##############################################################################
+# Helpers: radvd  (IPv6 Router Advertisement)
+##############################################################################
+
+# _enable_ipv6_in_namespace <veth_n>
+# Enables IPv6 forwarding inside the namespace for the given interface.
+# Disables DAD and temporary addresses to avoid tentative/dadfailed states.
+_enable_ipv6_in_namespace() {
+    local veth_n="$1"
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=0   >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.forwarding=1      >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.accept_ra=1       >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.accept_dad=0      >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.accept_dad=0  >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.use_tempaddr=0    >/dev/null 2>&1 || true
+    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.use_tempaddr=0 >/dev/null 2>&1 || true
+    if [ -n "${veth_n}" ]; then
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".accept_dad=0   >/dev/null 2>&1 || true
+        ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf."${veth_n}".use_tempaddr=0 >/dev/null 2>&1 || true
+    fi
+}
+
+# _write_radvd_conf <veth_n> <ip6_gateway> <ip6_cidr> [<dns6>]
+# Generates /radvd/radvd.conf for the given interface and prefix.
+# ip6_cidr must be in CIDR notation (e.g. 2001:db8:1::/64).
+# dns6 is an optional comma-separated list of IPv6 DNS server addresses.
+_write_radvd_conf() {
+    local veth_n="$1" ip6_gw="$2" ip6_cidr="$3" dns6="${4:-}"
+
+    local dir; dir=$(_radvd_dir)
+    mkdir -p "${dir}"
+
+    # Use the network address from ip6_cidr (all interface bits zero) as the
+    # radvd prefix.  Using the gateway address (e.g. ::1/64) causes radvd to
+    # reject the config on strict versions because host bits are set.
+    local prefix_addr prefix_size
+    prefix_addr=$(echo "${ip6_cidr}" | cut -d'/' -f1)
+    prefix_size=$(echo "${ip6_cidr}" | cut -d'/' -f2)
+
+    cat > "$(_radvd_conf)" << EOF
+# Auto-generated by network-namespace-wrapper.sh — do not edit
+interface ${veth_n}
+{
+    AdvSendAdvert on;
+    MinRtrAdvInterval 5;
+    MaxRtrAdvInterval 15;
+    prefix ${prefix_addr}/${prefix_size}
+    {
+        AdvOnLink on;
+        AdvAutonomous on;
+    };
+EOF
+
+    if [ -n "${dns6}" ]; then
+        local dns
+        # shellcheck disable=SC2086
+        for dns in $(echo "${dns6}" | tr ',' ' '); do
+            [ -z "${dns}" ] && continue
+            cat >> "$(_radvd_conf)" << EOF
+    RDNSS ${dns}
+    {
+        AdvRDNSSLifetime 30;
+    };
+EOF
+        done
+    fi
+
+    echo "};" >> "$(_radvd_conf)"
+    log "radvd: wrote config $(_radvd_conf)"
+}
+
+_svc_start_or_reload_radvd() {
+    _require_binary radvd
+    local pid_f; pid_f=$(_radvd_pid)
+    if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
+        log "radvd: sending SIGHUP to reload (pid=$(cat "${pid_f}"))"
+        kill -HUP "$(cat "${pid_f}")" 2>/dev/null || true
+    else
+        log "radvd: starting in namespace ${NAMESPACE}"
+        local _ct_out
+        # Use 'if !' to prevent set -e from killing the script on radvd failure.
+        # Flag mapping (this radvd build): -C PATH = config file, -c = configtest.
+        if ! _ct_out=$(ip netns exec "${NAMESPACE}" radvd \
+                -C "$(_radvd_conf)" -c 2>&1); then
+            die "radvd config test failed: ${_ct_out}"
+        fi
+        ip netns exec "${NAMESPACE}" radvd \
+            -C "$(_radvd_conf)" \
+            -p "$(_radvd_pid)"  \
+            -m syslog
+        log "radvd: started in namespace ${NAMESPACE}"
+    fi
+}
+
+_svc_stop_radvd() {
+    local pid_f; pid_f=$(_radvd_pid)
+    if [ -f "${pid_f}" ]; then
+        local pid; pid=$(cat "${pid_f}")
+        kill "${pid}" 2>/dev/null || true
+        rm -f "${pid_f}"
+        log "radvd: stopped (pid=${pid})"
+    fi
 }
 
 ##############################################################################
@@ -1553,6 +1781,7 @@ PYEOF
 }
 
 _svc_reload_haproxy() {
+    _require_binary haproxy
     local conf_f; conf_f=$(_haproxy_conf)
     local pid_f;  pid_f=$(_haproxy_pid)
 
@@ -1563,13 +1792,13 @@ _svc_reload_haproxy() {
             log "WARNING: haproxy reload failed; attempting fresh start"
             rm -f "${pid_f}" 2>/dev/null || true
             if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>/dev/null; then
-                log "WARNING: haproxy start failed — is haproxy installed on this host?"
+                die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
             fi
         fi
     else
         log "haproxy: starting in namespace ${NAMESPACE}"
         if ! ip netns exec "${NAMESPACE}" haproxy -f "${conf_f}" -p "${pid_f}" 2>/dev/null; then
-            log "WARNING: haproxy start failed — is haproxy installed on this host?"
+            die "haproxy failed to start — check ${conf_f} and ${LOG_FILE} for details"
         fi
     fi
 }
@@ -1700,6 +1929,7 @@ EOF
 }
 
 _svc_start_or_reload_apache2() {
+    _require_binary apache2 httpd
     local bin; bin=$(_find_apache2_bin)
     local pid_f; pid_f=$(_apache2_pid)
 
@@ -1710,7 +1940,7 @@ _svc_start_or_reload_apache2() {
     else
         log "apache2: starting in namespace ${NAMESPACE}"
         if ! ip netns exec "${NAMESPACE}" "${bin}" -f "$(_apache2_conf)" -k start 2>/dev/null; then
-            log "WARNING: apache2 start failed — is apache2/httpd installed on this host?"
+            die "apache2/httpd failed to start — check $(_apache2_conf) and ${LOG_FILE} for details"
         fi
     fi
 
@@ -1886,11 +2116,31 @@ cmd_config_dhcp_subnet() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "config-dhcp-subnet: network=${NETWORK_ID} ns=${NAMESPACE} gw=${GATEWAY} cidr=${CIDR}"
     [ -z "${GATEWAY}" ] && die "config-dhcp-subnet: missing --gateway"
     [ -z "${CIDR}" ]    && die "config-dhcp-subnet: missing --cidr"
     _write_dnsmasq_conf false
     _svc_start_or_reload_dnsmasq
+    if [ -n "${NETWORK_IP6_GATEWAY}" ] && [ -n "${NETWORK_IP6_CIDR}" ]; then
+        local veth_n; veth_n=$(veth_ns_name "${VLAN}" "${CHOSEN_ID}")
+        # implement-network may have run before CloudStack assigned the IPv6
+        # gateway to this network.  Ensure the namespace is configured for IPv6,
+        # the gateway address is on the veth, and state files are persisted so
+        # that subsequent commands and the discovery path can find them.
+        _enable_ipv6_in_namespace "${veth_n}"
+        local ip6_prefix; ip6_prefix=$(echo "${NETWORK_IP6_CIDR}" | cut -d'/' -f2)
+        ip netns exec "${NAMESPACE}" ip -6 addr show "${veth_n}" 2>/dev/null | \
+            grep -q "${NETWORK_IP6_GATEWAY}/" || \
+            ip netns exec "${NAMESPACE}" ip -6 addr add \
+                "${NETWORK_IP6_GATEWAY}/${ip6_prefix}" dev "${veth_n}" 2>/dev/null || true
+        local nsd; nsd=$(_net_state_dir)
+        [ -f "${nsd}/ip6-gateway" ] || echo "${NETWORK_IP6_GATEWAY}" > "${nsd}/ip6-gateway"
+        [ -f "${nsd}/ip6-cidr"    ] || echo "${NETWORK_IP6_CIDR}"    > "${nsd}/ip6-cidr"
+        [ -n "${DNS6_SERVER}" ] && { [ -f "${nsd}/dns6" ] || echo "${DNS6_SERVER}" > "${nsd}/dns6"; }
+        _write_radvd_conf "${veth_n}" "${NETWORK_IP6_GATEWAY}" "${NETWORK_IP6_CIDR}" "${DNS6_SERVER}"
+        _svc_start_or_reload_radvd
+    fi
     release_lock
     log "config-dhcp-subnet: done network=${NETWORK_ID}"
 }
@@ -1904,6 +2154,7 @@ cmd_config_dns_subnet() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "config-dns-subnet: network=${NETWORK_ID} ns=${NAMESPACE} gw=${GATEWAY} cidr=${CIDR}"
     [ -z "${GATEWAY}" ] && die "config-dns-subnet: missing --gateway"
     [ -z "${CIDR}" ]    && die "config-dns-subnet: missing --cidr"
@@ -1922,6 +2173,21 @@ cmd_config_dns_subnet() {
 
     _write_dnsmasq_conf true
     _svc_start_or_reload_dnsmasq
+    if [ -n "${NETWORK_IP6_GATEWAY}" ] && [ -n "${NETWORK_IP6_CIDR}" ]; then
+        local veth_n; veth_n=$(veth_ns_name "${VLAN}" "${CHOSEN_ID}")
+        _enable_ipv6_in_namespace "${veth_n}"
+        local ip6_prefix; ip6_prefix=$(echo "${NETWORK_IP6_CIDR}" | cut -d'/' -f2)
+        ip netns exec "${NAMESPACE}" ip -6 addr show "${veth_n}" 2>/dev/null | \
+            grep -q "${NETWORK_IP6_GATEWAY}/" || \
+            ip netns exec "${NAMESPACE}" ip -6 addr add \
+                "${NETWORK_IP6_GATEWAY}/${ip6_prefix}" dev "${veth_n}" 2>/dev/null || true
+        local nsd; nsd=$(_net_state_dir)
+        [ -f "${nsd}/ip6-gateway" ] || echo "${NETWORK_IP6_GATEWAY}" > "${nsd}/ip6-gateway"
+        [ -f "${nsd}/ip6-cidr"    ] || echo "${NETWORK_IP6_CIDR}"    > "${nsd}/ip6-cidr"
+        [ -n "${DNS6_SERVER}" ] && { [ -f "${nsd}/dns6" ] || echo "${DNS6_SERVER}" > "${nsd}/dns6"; }
+        _write_radvd_conf "${veth_n}" "${NETWORK_IP6_GATEWAY}" "${NETWORK_IP6_CIDR}" "${DNS6_SERVER}"
+        _svc_start_or_reload_radvd
+    fi
     release_lock
     log "config-dns-subnet: done network=${NETWORK_ID}"
 }
@@ -1937,7 +2203,8 @@ cmd_remove_dhcp_subnet() {
     acquire_lock "${NETWORK_ID}"
     log "remove-dhcp-subnet: network=${NETWORK_ID}"
     _svc_stop_dnsmasq
-    rm -rf "$(_dnsmasq_dir)"
+    _svc_stop_radvd
+    rm -rf "$(_dnsmasq_dir)" "$(_radvd_dir)"
     release_lock
     log "remove-dhcp-subnet: done network=${NETWORK_ID}"
 }
@@ -1951,6 +2218,7 @@ cmd_remove_dns_subnet() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "remove-dns-subnet: network=${NETWORK_ID}"
     if [ -f "$(_dnsmasq_conf)" ]; then
         _write_dnsmasq_conf false
@@ -1969,6 +2237,7 @@ cmd_add_dhcp_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "add-dhcp-entry: network=${NETWORK_ID} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
     [ -z "${MAC}" ]   && die "add-dhcp-entry: missing --mac"
     [ -z "${VM_IP}" ] && die "add-dhcp-entry: missing --ip"
@@ -2022,6 +2291,7 @@ cmd_remove_dhcp_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "remove-dhcp-entry: network=${NETWORK_ID} mac=${MAC}"
     [ -z "${MAC}" ] && die "remove-dhcp-entry: missing --mac"
 
@@ -2051,6 +2321,7 @@ cmd_add_dns_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "add-dns-entry: network=${NETWORK_ID} hostname=${HOSTNAME} ip=${VM_IP}"
     [ -z "${VM_IP}" ]    && die "add-dns-entry: missing --ip"
     [ -z "${HOSTNAME}" ] && die "add-dns-entry: missing --hostname"
@@ -2063,6 +2334,13 @@ cmd_add_dns_entry() {
     grep -v "^${VM_IP}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
     mv "${hosts}.tmp" "${hosts}"
     echo "${VM_IP} ${HOSTNAME}" >> "${hosts}"
+
+    # Also add AAAA record when an IPv6 address is provided for this NIC
+    if [ -n "${NIC_IP6_ADDRESS}" ]; then
+        grep -v "^${NIC_IP6_ADDRESS}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
+        mv "${hosts}.tmp" "${hosts}"
+        echo "${NIC_IP6_ADDRESS} ${HOSTNAME}" >> "${hosts}"
+    fi
 
     _svc_start_or_reload_dnsmasq
     release_lock
@@ -2078,6 +2356,7 @@ cmd_remove_dns_entry() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "remove-dns-entry: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "remove-dns-entry: missing --ip"
 
@@ -2085,6 +2364,11 @@ cmd_remove_dns_entry() {
     if [ -f "${hosts}" ]; then
         grep -v "^${VM_IP}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
         mv "${hosts}.tmp" "${hosts}"
+        # Also remove the AAAA record when an IPv6 address was associated
+        if [ -n "${NIC_IP6_ADDRESS}" ]; then
+            grep -v "^${NIC_IP6_ADDRESS}[[:space:]]" "${hosts}" > "${hosts}.tmp" 2>/dev/null || true
+            mv "${hosts}.tmp" "${hosts}"
+        fi
         _svc_start_or_reload_dnsmasq
     fi
     release_lock
@@ -2102,6 +2386,7 @@ cmd_prepare_nic() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "prepare-nic: network=${NETWORK_ID} ns=${NAMESPACE} guest_type=${GUEST_TYPE} mac=${MAC} ip=${VM_IP} hostname=${HOSTNAME}"
 
     # ---- Shared network: lazily implement on first NIC attach ----
@@ -2174,6 +2459,7 @@ cmd_release_nic() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
     log "release-nic: network=${NETWORK_ID} ns=${NAMESPACE} mac=${MAC} ip=${VM_IP}"
 
     local dnsmasq_reloaded="false"
@@ -2230,6 +2516,7 @@ cmd_save_userdata() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-userdata: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "save-userdata: missing --ip"
 
@@ -2258,6 +2545,7 @@ cmd_save_password() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-password: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "save-password: missing --ip"
 
@@ -2287,6 +2575,7 @@ cmd_save_sshkey() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-sshkey: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ] && die "save-sshkey: missing --ip"
 
@@ -2311,6 +2600,7 @@ cmd_save_hypervisor_hostname() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-hypervisor-hostname: network=${NETWORK_ID} ip=${VM_IP} host=${HYPERVISOR_HOSTNAME}"
     [ -z "${VM_IP}" ] && die "save-hypervisor-hostname: missing --ip"
 
@@ -2345,6 +2635,7 @@ cmd_save_vm_data() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary apache2 httpd
     log "save-vm-data: network=${NETWORK_ID} ip=${VM_IP}"
     [ -z "${VM_IP}" ]   && die "save-vm-data: missing --ip"
 
@@ -2519,7 +2810,7 @@ cmd_apply_fw_rules() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
-    _guard_ns_shutdown "apply-fw-rules"
+    _guard_ns_teardown "apply-fw-rules"
     log "apply-fw-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     local fw_rules_file=""
@@ -2549,13 +2840,14 @@ cmd_apply_fw_rules() {
 
     # ---- 4. Build iptables rules via Python ----
     python3 - "${NAMESPACE}" "${fw_rules_file}" "${veth_n}" \
-              "${fw_chain}" << 'PYEOF'
-import json, re, subprocess, sys
+              "${fw_chain}" "$(_vpc_state_dir)" << 'PYEOF'
+import json, os, re, subprocess, sys
 
 namespace = sys.argv[1]
 rules_file = sys.argv[2]
 veth_n    = sys.argv[3]
 fw_chain  = sys.argv[4]   # filter table egress chain (CS_EXTNET_FWRULES_<N>)
+state_dir = sys.argv[5]   # vpc-or-network state directory for static-nat entries
 
 try:
     with open(rules_file, 'r', encoding='utf-8') as f:
@@ -2607,9 +2899,6 @@ egress_rules  = [r for r in rules if r.get('type') == 'egress']
 # Handles only outbound guest-VM traffic (-i <veth_n>).
 # ---------------------------------------------------------------------------
 
-# Allow established/related first so ongoing sessions are never interrupted.
-iptf('-A', fw_chain, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
-
 # Explicit egress rules.
 # default_egress_allow=true  → explicit rules are DROP  (deny specific traffic)
 # default_egress_allow=false → explicit rules are ACCEPT (allow specific traffic)
@@ -2659,6 +2948,11 @@ else:
 # RETURN so that fchain catch-all rules (static-NAT, PF, etc.) remain active
 # for any non-VM traffic that reaches this chain.
 iptf('-A', fw_chain, '-j', 'RETURN')
+
+# Insert established/related last so it lands at position 1 regardless of what
+# was appended above — ongoing sessions must never be re-evaluated against the
+# explicit egress rules/default policy, no matter how this chain is built.
+iptf('-I', fw_chain, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
 
 # ---------------------------------------------------------------------------
 # PART 2 – Ingress firewall in mangle table, PREROUTING hook (before DNAT)
@@ -2728,16 +3022,41 @@ for pub_ip, ip_rules in pub_ip_rules.items():
             a += ['-j', 'RETURN']
             iptm(*a)
 
-    # Always allow packets belonging to an already-established session.
-    iptm('-A', chain_name, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
     # Default: drop new connections not matched by any explicit rule above.
     iptm('-A', chain_name, '-j', 'DROP')
+    # Insert established/related last so it lands at position 1 regardless of
+    # what was appended above — active sessions must never be re-evaluated
+    # against the explicit rules/deny-all, no matter how this chain is built.
+    iptm('-I', chain_name, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
+
+# Step 3: create default-DROP chains for static-NAT IPs that have no ingress
+# rules in this invocation.  Without this, removing all firewall rules for a
+# static-NAT IP leaves no mangle chain for that IP, so inbound traffic is never
+# filtered and the VM remains reachable despite having no allowed firewall rules.
+static_nat_dir = os.path.join(state_dir, 'static-nat')
+n_protected = 0
+if os.path.isdir(static_nat_dir):
+    for fn in os.listdir(static_nat_dir):
+        if not re.match(r'^\d+\.\d+\.\d+\.\d+$', fn):
+            continue
+        pub_ip = fn
+        if pub_ip in pub_ip_rules:
+            continue  # already has an explicit chain built above
+        chain_name = FW_INGRESS_PREFIX + pub_ip
+        iptm('-N', chain_name)
+        iptm('-A', 'PREROUTING', '-d', f'{pub_ip}/32', '-j', chain_name)
+        iptm('-A', chain_name, '-j', 'DROP')
+        # Insert established/related last so it lands at position 1 (see the
+        # main pub_ip_rules loop above for why).
+        iptm('-I', chain_name, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'RETURN')
+        n_protected += 1
 
 n_in  = sum(len(v) for v in pub_ip_rules.values())
 n_eg  = len(egress_rules)
 policy = 'ALLOW' if default_egress_allow else 'DENY'
 print(f"apply-fw-rules: built {n_in} ingress rule(s) across {len(pub_ip_rules)} public IP(s), "
-      f"{n_eg} egress rule(s), default_egress={policy}")
+      f"{n_eg} egress rule(s), default_egress={policy}, "
+      f"default-DROP chains for {n_protected} static-NAT IP(s) with no rules")
 PYEOF
 
     local py_exit=$?
@@ -2780,6 +3099,7 @@ cmd_apply_lb_rules() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary haproxy
     log "apply-lb-rules: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     # Normalise empty input
@@ -3007,6 +3327,11 @@ _pbr_list_rules() {
     fi
 }
 
+_fw_list_rules() {
+    [ -z "${NAMESPACE}" ] && die "list-firewall-rules: namespace not resolved"
+    ip netns exec "${NAMESPACE}" iptables-save 2>/dev/null || true
+}
+
 _pbr_emit_custom_action_result() {
     local action="$1"
     shift
@@ -3037,6 +3362,19 @@ elif action == "pbr-list-routes":
 elif action == "pbr-list-rules":
     data = [{"rule": row} for row in rows]
     print(json.dumps({"status": "success", "printmessage": "true", "message": data}))
+elif action == "list-firewall-rules":
+    tables, cur_table, cur_lines = [], None, []
+    for line in raw.splitlines():
+        line = line.rstrip()
+        if line.startswith('*'):
+            cur_table, cur_lines = line[1:], []
+        elif line == 'COMMIT':
+            if cur_table:
+                tables.append({"table": cur_table, "rules": "\n".join(cur_lines)})
+            cur_table = None
+        elif cur_table and not line.startswith('#'):
+            cur_lines.append(line)
+    print(json.dumps({"status": "success", "printmessage": "true", "message": tables}))
 else:
     msg = rows[0] if rows else f"{action}: OK"
     print(json.dumps({"status": "success", "printmessage": "true", "message": msg}))
@@ -3150,13 +3488,16 @@ cmd_custom_action() {
         pbr-list-rules)
             _pbr_emit_custom_action_result "pbr-list-rules" _pbr_list_rules
             ;;
+        list-firewall-rules)
+            _pbr_emit_custom_action_result "list-firewall-rules" _fw_list_rules
+            ;;
         *)
             local hook="${STATE_DIR}/hooks/custom-action-${ACTION_NAME}.sh"
             if [ -x "${hook}" ]; then
                 exec "${hook}" --network-id "${NETWORK_ID}" --action "${ACTION_NAME}" \
                      --action-params "${ACTION_PARAMS_JSON}"
             else
-                die "Unknown action '${ACTION_NAME}'. Built-ins: reboot-device, dump-config, pbr-*"
+                die "Unknown action '${ACTION_NAME}'. Built-ins: reboot-device, dump-config, list-firewall-rules, pbr-*"
             fi
             ;;
     esac
@@ -3182,6 +3523,9 @@ cmd_restore_network() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
+    _require_binary dnsmasq
+    _require_binary apache2 httpd
+    _require_binary haproxy
     log "restore-network: network=${NETWORK_ID} ns=${NAMESPACE}"
 
     local restore_data_file=""
@@ -3470,10 +3814,8 @@ cmd_implement_vpc() {
     # Ensure per-namespace iproute2 rt_tables for PBR isolation
     _pbr_ensure_table_file
 
-    # Disable IPv6 inside the namespace
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
-    ip netns exec "${NAMESPACE}" sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
+    # IPv6 is managed per-tier by implement-network: each VPC tier enables or
+    # disables IPv6 on its own guest veth without touching sibling tiers.
 
     # ---- 2. IP forwarding ----
     ip netns exec "${NAMESPACE}" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -3732,7 +4074,7 @@ cmd_apply_network_acl() {
     parse_args "$@"
     _load_state
     acquire_lock "${NETWORK_ID}"
-    _guard_ns_shutdown "apply-network-acl"
+    _guard_ns_teardown "apply-network-acl"
     log "apply-network-acl: network=${NETWORK_ID} ns=${NAMESPACE} cidr=${CIDR}"
 
     local acl_rules_file=""
@@ -3749,7 +4091,17 @@ cmd_apply_network_acl() {
     acl_chain_name=$(acl_chain "${NETWORK_ID}")
     fchain=$(filter_chain "${NETWORK_ID}")
 
-    # ---- 1. Remove existing jump from fchain to acl chain (idempotent) ----
+    # ---- 1. Remove existing jump(s) from fchain to acl chain (idempotent) ----
+    # Jumps are scoped by interface (-i/-o, see step 5 below) so both forms
+    # must be removed here — an unscoped jump from an older run of this
+    # script, if one is still present, is cleared out too. If any reference
+    # to acl_chain_name survives this step, the -X delete in step 2 fails
+    # silently (chain still in use) and the -N create in step 3 then fails
+    # with "Chain already exists" on the next call.
+    ip netns exec "${NAMESPACE}" iptables -t filter \
+        -D "${fchain}" -i "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
+    ip netns exec "${NAMESPACE}" iptables -t filter \
+        -D "${fchain}" -o "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
     ip netns exec "${NAMESPACE}" iptables -t filter \
         -D "${fchain}" -j "${acl_chain_name}" 2>/dev/null || true
 
@@ -3797,8 +4149,6 @@ if rules_json:
 else:
     rules = []
 
-# Always allow RELATED,ESTABLISHED so active sessions are not dropped.
-iptf('-A', acl_chain, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
 
 for rule in sorted(rules, key=lambda r: r.get('number', 999)):
     direction  = rule.get('trafficType', 'ingress').lower()
@@ -3846,6 +4196,11 @@ for rule in sorted(rules, key=lambda r: r.get('number', 999)):
 # Default: DROP all unmatched traffic (implicit deny at end of ACL)
 iptf('-A', acl_chain, '-j', 'DROP')
 
+# Insert RELATED,ESTABLISHED last so it lands at position 1 regardless of what
+# was appended above — active sessions must never be re-evaluated against the
+# explicit rules/deny-all, no matter how this chain is built.
+iptf('-I', acl_chain, '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
+
 print(f"apply-network-acl: applied {len(rules)} ACL rule(s) to chain {acl_chain}")
 PYEOF
 
@@ -3861,10 +4216,22 @@ PYEOF
 
     # ---- 5. Insert jump from fchain to acl chain at position 1 ----
     # ACL rules take precedence over the catch-all ACCEPT rules in fchain.
+    #
+    # The jump MUST be scoped to this network's own veth (-o for traffic
+    # heading to the guest, -i for traffic coming from it). All tiers in a
+    # VPC share one namespace and one top-level FORWARD chain, so an
+    # unconditional jump here would hand every OTHER tier's traffic to this
+    # ACL chain too — and since the chain ends in an unconditional catch-all
+    # DROP (the implicit deny), it would silently swallow packets for tiers
+    # evaluated after this one, before they ever reach their own (correct)
+    # ACL chain. Scoping by interface keeps each tier's implicit deny from
+    # catching anything but its own traffic.
     if ip netns exec "${NAMESPACE}" iptables -t filter -n -L "${fchain}" >/dev/null 2>&1; then
         ip netns exec "${NAMESPACE}" iptables -t filter \
-            -I "${fchain}" 1 -j "${acl_chain_name}" 2>/dev/null || true
-        log "apply-network-acl: inserted ACL jump in ${fchain}"
+            -I "${fchain}" 1 -i "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
+        ip netns exec "${NAMESPACE}" iptables -t filter \
+            -I "${fchain}" 1 -o "${veth_n}" -j "${acl_chain_name}" 2>/dev/null || true
+        log "apply-network-acl: inserted ACL jump in ${fchain} (scoped to ${veth_n})"
     fi
 
     release_lock

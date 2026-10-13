@@ -310,6 +310,15 @@ cmk createExtension \
     details[0].network.services="Vpn,Dhcp,Dns,SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
     details[1].network.service.capabilities={\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per\ public\ ip\"}}
 ```
+or with less services,
+```bash
+cmk createExtension \
+    name=my-extnet \
+    type=NetworkOrchestrator \
+    path=network-namespace \
+    details[0].network.services="SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
+    details[1].network.service.capabilities="{\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per public ip\"}}"
+```
 
 The two details declare which services this extension provides and their
 CloudStack capability values.  These are consulted when listing network service
@@ -380,11 +389,11 @@ cmk updateRegisteredExtension \
     extensionid=<extension-uuid> \
     resourcetype=PhysicalNetwork \
     resourceid=<phys-net-uuid> \
-    "details[0].key=hosts"                 "details[0].value=192.168.10.1,192.168.10.2" \
-    "details[1].key=username"              "details[1].value=root" \
-    "details[2].key=sshkey"                "details[2].value=<pem-key-contents>" \
-    "details[3].key=guest.network.device"  "details[3].value=eth1" \
-    "details[4].key=public.network.device" "details[4].value=eth1"
+    "details[0].hosts=192.168.10.1,192.168.10.2" \
+    "details[1].username=root" \
+    "details[2].sshkey=<pem-key-contents>" \
+    "details[3].guest.network.device=eth1" \
+    "details[4].public.network.device=eth1"
 ```
 
 > **`network.isolation.method=NetworkExtension`** must be set as an Extension
@@ -648,8 +657,11 @@ network-namespace.sh destroy-network  --network-id 42 --vlan 100
 6. For **VPC tier** networks: deregisters this tier from the VPC — namespace is
    only removed by a subsequent `destroy-vpc` call.
 
-> The host bridge `breth1-100` and VLAN sub-interface `eth1.100` are **not**
-> removed — they may still be used by other networks or for VM connectivity.
+> The host bridge `breth1-100` and VLAN sub-interface `eth1.100` are removed
+> once nothing else is attached to the bridge (checked via
+> `teardown_host_bridge_if_unused`). If another network/tenant is still
+> sharing the same physical VLAN, or a VM tap is still attached, the bridge
+> and VLAN sub-interface are left in place.
 
 ### 9. Unregister and delete the extension
 
@@ -700,9 +712,9 @@ cmk updateRegisteredExtension \
     extensionid=<ext-a-uuid> \
     resourcetype=PhysicalNetwork \
     resourceid=<pn-uuid> \
-    "details[0].key=hosts"                 "details[0].value=10.0.0.1,10.0.0.2" \
-    "details[1].key=guest.network.device"  "details[1].value=eth1" \
-    "details[2].key=public.network.device" "details[2].value=eth1"
+    "details[0].hosts=10.0.0.1,10.0.0.2" \
+    "details[1].guest.network.device=eth1" \
+    "details[2].public.network.device=eth1"
 ```
 
 When creating network offerings, reference the specific extension name:
@@ -724,6 +736,74 @@ CloudStack resolves which extension to call by:
    that provider name.
 3. Calling `NetworkExtensionElement` scoped to that specific provider/extension
    (via `NetworkExtensionElement.withProviderName()`).
+
+---
+
+## IPv6 support
+
+The network-namespace extension supports IPv6 guest networks via stateless address auto-configuration
+(SLAAC) using **radvd** (Router Advertisement Daemon), mirroring the approach used by CloudStack's
+built-in VPC router (`CsVpcGuestNetwork.py`).
+
+### How it works
+
+When `network_ip6_gateway` and `network_ip6_cidr` are present in the `implement-network` payload:
+
+1. **`implement-network`** enables IPv6 in the namespace (`net.ipv6.conf.all.disable_ipv6=0`,
+   forwarding on, DAD and temporary addresses disabled) and assigns the IPv6 gateway address
+   to the guest veth interface inside the namespace.
+2. **`config-dhcp-subnet`** or **`config-dns-subnet`** writes `/radvd/radvd.conf` and starts
+   radvd inside the namespace.  radvd sends Router Advertisements on the guest veth, advertising
+   the `/64` (or configured) prefix so VMs can self-configure via SLAAC.
+3. **`add-dns-entry`** adds both an A record (IPv4) and an AAAA record (IPv6, from `ip6_address`)
+   to the dnsmasq hosts file so guests can resolve VM hostnames over IPv6.
+4. **`remove-dhcp-subnet`** / **`shutdown-network`** / **`destroy-network`** stops radvd and
+   removes its state directory.
+
+### radvd configuration
+
+The generated `radvd.conf` follows the same format as `CsVpcGuestNetwork.py`:
+
+```
+interface <guest-veth>
+{
+    AdvSendAdvert on;
+    MinRtrAdvInterval 5;
+    MaxRtrAdvInterval 15;
+    prefix <network_ip6_gateway>/<prefix-len>
+    {
+        AdvOnLink on;
+        AdvAutonomous on;
+    };
+    RDNSS <dns6-server>          # one block per server from dns6
+    {
+        AdvRDNSSLifetime 30;
+    };
+};
+```
+
+### VPC networks
+
+For VPC networks the shared namespace is created by `implement-vpc` (IPv6-neutral — no IPv6 is
+enabled or disabled at that stage).  Each VPC tier network runs its own `implement-network`, which
+independently enables or disables IPv6 on its own guest veth.  This allows mixed VPC topologies
+where some tiers have IPv6 and others do not.
+
+Each IPv6 tier also runs its own **radvd** instance inside the shared namespace, bound to its own
+guest veth.  radvd correctly handles multiple instances in the same namespace as long as each
+instance is bound to a distinct interface.
+
+### State files
+
+IPv6 state is persisted under the per-network state directory:
+
+| File | Content |
+|------|---------|
+| `network-<id>/ip6-gateway` | IPv6 gateway address assigned to the namespace veth |
+| `network-<id>/ip6-cidr` | IPv6 CIDR of the guest subnet |
+| `network-<id>/dns6` | Comma-separated IPv6 DNS server list (RDNSS) |
+| `network-<id>/radvd/radvd.conf` | Generated radvd configuration |
+| `network-<id>/radvd/radvd.pid` | PID of the running radvd process |
 
 ---
 
@@ -767,11 +847,17 @@ Actions:
    `--extension-ip` is not given) to `vn-<vlan>-<id>` inside the namespace.
    When the extension IP differs from the gateway a default route via the gateway
    is also added inside the namespace.
-7. Disable IPv6 inside the namespace (all interfaces).
-8. Enable IP forwarding inside the namespace.
+7. IPv6 handling:
+   - When `--network-ip6-gateway` / `--network-ip6-cidr` are provided: enable IPv6 forwarding
+     inside the namespace (disable DAD, enable forwarding and accept_ra) and assign the IPv6
+     gateway address to `vn-<vlan>-<id>`.
+   - When no IPv6 is configured: disable IPv6 on the guest veth interface.
+     For standalone networks the global namespace disable is also applied; for VPC tier networks
+     the global setting is left unchanged to avoid clobbering sibling tiers that may have IPv6.
+8. Enable IPv4 IP forwarding inside the namespace.
 9. Create iptables chains `CS_EXTNET_<id>_PR` (nat PREROUTING DNAT),
    `CS_EXTNET_<id>_POST` (nat POSTROUTING SNAT), and `CS_EXTNET_FWD_<id>` (filter FORWARD).
-10. Save VLAN, gateway, CIDR, extension-ip, and namespace to state files.
+10. Save VLAN, gateway, CIDR, extension-ip, IPv6 gateway, IPv6 CIDR, and namespace to state files.
 
 ### `shutdown-network`
 
@@ -812,8 +898,9 @@ Actions:
    removed by a subsequent `destroy-vpc` call.
 
 > The host bridge `br<GUEST_ETH>-<vlan>` and VLAN sub-interface `GUEST_ETH.<vlan>`
-> are NOT removed on destroy — they may still be used by other networks or for
-> VM connectivity.
+> are removed on destroy once the bridge has no remaining member interfaces
+> (`teardown_host_bridge_if_unused`). This is a no-op if another network/tenant
+> is still sharing the same physical VLAN, or a VM tap is still attached.
 
 ### VPC lifecycle commands: `implement-vpc`, `update-vpc-source-nat-ip`, `shutdown-vpc`, `destroy-vpc`
 
@@ -834,7 +921,9 @@ network-namespace-wrapper.sh implement-vpc \
 
 Actions:
 1. Create the shared VPC namespace `cs-vpc-<vpc-id>` (idempotent).
-2. Disable IPv6 and enable IP forwarding inside the namespace.
+2. Enable IPv4 IP forwarding inside the namespace.
+   IPv6 is managed per-tier by `implement-network` (each tier enables or disables IPv6 on its
+   own guest veth without affecting sibling tiers).
 3. Optionally, when `--source-nat true`, `--public-ip`, and `--public-vlan` are all
    provided and `--vpc-cidr` (VPC CIDR) is given:
    * Create public veth pair `vph-<pvlan>-<vpc-id>` (host) / `vpn-<pvlan>-<vpc-id>` (namespace).
@@ -966,7 +1055,10 @@ Actions:
 4. Remove host route `<public-ip>/32`.
 5. Remove IP address from `vpn-<pvlan>-<id>` inside namespace.
 6. If no other IPs share the same `<pvlan>/<id>` combination, delete
-   `vph-<pvlan>-<id>` (host veth).
+   `vph-<pvlan>-<id>` (host veth), then attempt to remove the public bridge
+   `br<PUB_ETH>-<pvlan>` and VLAN sub-interface `PUB_ETH.<pvlan>` — a no-op
+   (`teardown_host_bridge_if_unused`) if another network/tenant is still
+   sharing the same public VLAN.
 7. Remove state files.
 
 ### `add-static-nat`
@@ -1390,6 +1482,7 @@ Built-in actions:
 |--------|-------------|
 | `reboot-device` | Bounces the guest veth pair (`vh-<vlan>-<id>` down → up) |
 | `dump-config` | Prints namespace IP addresses, iptables rules, and per-network state to stdout |
+| `list-firewall-rules` | List iptables rules inside the namespace |
 | `pbr-create-table` | Create or update a routing-table entry in `/etc/iproute2/rt_tables` |
 | `pbr-delete-table` | Remove a routing-table entry from `/etc/iproute2/rt_tables` |
 | `pbr-list-tables` | List non-comment routing-table entries from `/etc/iproute2/rt_tables` |
@@ -1498,10 +1591,11 @@ name bridges as `br<eth>-<vlan>` and veth pairs as `vh-<vlan>-<id>` /
 | `gateway` | Guest network gateway |
 | `cidr` | Guest network CIDR |
 | `vpc_id` | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
-| `network_ip6_gateway` | Guest IPv6 gateway, when configured |
-| `network_ip6_cidr` | Guest IPv6 CIDR, when configured |
+| `network_ip6_gateway` | Guest IPv6 gateway address (assigned to the namespace veth), when configured |
+| `network_ip6_cidr` | Guest IPv6 CIDR (e.g. `2001:db8:1::/64`), when configured |
 | `extension_ip` | IP for DHCP/DNS/metadata service — equals gateway when SourceNat/Gateway is active, otherwise a dedicated placeholder IP |
-| `dns` | Comma-separated DNS server list |
+| `dns` | Comma-separated IPv4 DNS server list |
+| `dns6` | Comma-separated IPv6 DNS server list (advertised via RDNSS in radvd RA) |
 | `domain` | Network domain suffix |
 | `current_details` | `ensure-network-device` only — previous selected-device JSON, used to preserve host affinity |
 
