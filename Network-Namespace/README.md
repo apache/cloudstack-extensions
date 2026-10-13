@@ -1,0 +1,1776 @@
+<!--
+ Licensed to the Apache Software Foundation (ASF) under one
+ or more contributor license agreements.  See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership.  The ASF licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+ -->
+# NetworkExtension for Apache CloudStack
+
+This directory contains the **NetworkExtension** `NetworkOrchestrator` extension —
+a CloudStack plugin that delegates all network operations to an external device
+over SSH.  The device can be a Linux server (using network namespaces,
+bridges, and iptables), a network appliance that accepts SSH commands, or any
+other host that can run the `network-namespace-wrapper.sh` (or a compatible
+script) to perform network configurations.
+
+The extension is implemented in
+`framework/extensions/src/main/java/org/apache/cloudstack/framework/extensions/network/NetworkExtensionElement.java`
+and loaded automatically by the management server — **no separate plugin JAR is
+required**.
+
+---
+
+## Table of Contents
+
+1. [Architecture](#architecture)
+2. [Directory contents](#directory-contents)
+3. [How it works](#how-it-works)
+4. [Installation](#installation)
+   - [Management server](#management-server)
+   - [Remote network device](#remote-network-device)
+5. [Step-by-step API setup](#step-by-step-api-setup)
+   - [1. Create the extension](#1-create-the-extension)
+   - [2. Register the extension with a physical network](#2-register-the-extension-with-a-physical-network)
+   - [3. Create a network offering](#3-create-a-network-offering)
+   - [4. Create an isolated network](#4-create-an-isolated-network)
+   - [5. Acquire a public IP and enable Source NAT](#5-acquire-a-public-ip-and-enable-source-nat)
+   - [6. Enable / disable Static NAT](#6-enable--disable-static-nat)
+   - [7. Add / delete Port Forwarding](#7-add--delete-port-forwarding)
+   - [8. Delete the network](#8-delete-the-network)
+   - [9. Unregister and delete the extension](#9-unregister-and-delete-the-extension)
+6. [Multiple extensions on the same physical network](#multiple-extensions-on-the-same-physical-network)
+7. [Wrapper script operations reference](#wrapper-script-operations-reference)
+8. [Payload reference](#payload-reference)
+9. [Custom actions](#custom-actions)
+10. [Developer / testing notes](#developer--testing-notes)
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  CloudStack Management Server                            │
+│                                                          │
+│  NetworkExtensionElement.java                            │
+│      │ executes (path resolved from Extension record)    │
+│      ▼                                                   │
+│  /usr/share/cloudstack-management/extensions/<ext-name>/ │
+│      <ext-name>.sh   (network-namespace.sh)              │
+└──────────────────────┬───────────────────────────────────┘
+                       │ SSH (host : port from extension details)
+                       │ credentials from extension_resource_map_details
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│  Remote Network Device  (KVM Linux server)               │
+│                                                          │
+│  network-namespace-wrapper.sh <command> [args...]        │
+│                                                          │
+│  Per-network data plane (guest VLAN 1910, network 209):  │
+│                                                          │
+│  HOST side                                               │
+│  ─────────────────────────────────────────────────       │
+│  eth1.1910  ─────────────────────────────────┐           │
+│  (VLAN sub-iface)                            │           │
+│                                    breth1-1910  (bridge) │
+│  vh-1910-d1  ─────────────────────────────────┘          │
+│      │                                                   │
+│  NAMESPACE  cs-net-209  (isolated)                       │
+│             cs-vpc-5    (VPC, vpc-id=5)                  │
+│  ─────────────────────────────────────────────────       │
+│  vn-1910-d1  ← gateway IP 10.1.1.1/24                    │
+│                                                          │
+│  PUBLIC side (source-NAT IP 10.0.56.4 on VLAN 101):      │
+│                                                          │
+│  HOST side                                               │
+│  eth1.101   ─────────────────────────────────┐           │
+│                                   breth1-101  (bridge)   │
+│  vph-101-209 ────────────────────────────────┘           │
+│      │                                                   │
+│  NAMESPACE  cs-net-209  (or  cs-vpc-<vpcId>)             │
+│  vpn-101-209  ← source-NAT IP  10.0.56.4/32              │
+│  default route → 10.0.56.1 (upstream gateway)            │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Naming conventions
+
+| Object | Name pattern | Example (VLAN 1910, net 209, pub-VLAN 101) |
+|--------|--------------|-------------------------------------------|
+| Namespace (isolated network)   | `cs-net-<networkId>` | `cs-net-209` |
+| Namespace (VPC network)        | `cs-vpc-<vpcId>`     | `cs-vpc-5` |
+| Guest host bridge              | `br<ethX>-<vlan>`    | `breth1-1910` |
+| Guest veth – host side         | `vh-<vlan>-<id>`     | `vh-1910-d1` |
+| Guest veth – namespace side    | `vn-<vlan>-<id>`     | `vn-1910-d1` |
+| Public host bridge             | `br<pub_ethX>-<pvlan>` | `breth1-101` |
+| Public veth – host side        | `vph-<pvlan>-<id>`   | `vph-101-209` |
+| Public veth – namespace side   | `vpn-<pvlan>-<id>`   | `vpn-101-209` |
+
+`ethX` (and `pub_ethX`) is the NIC specified in the `guest.network.device`
+(and `public.network.device`) key when registering the extension on the
+physical network.  Both default to `eth1` when not explicitly set.
+
+> **Note:** when `<vlan>` or `<id>` would make the interface name exceed the
+> Linux 15-character limit, the `<id>` portion is shortened to its hex
+> representation (for numeric IDs) or a 6-character MD5 prefix (for
+> non-numeric IDs).
+
+**Key design principles:**
+
+* The `network-namespace.sh` script runs on the **management server**.  All
+  connection details (`host`, `port`, `username`, `sshkey`, etc.) are passed as
+  two named CLI arguments injected by `NetworkExtensionElement` — the script
+  itself is completely generic and requires no local configuration.
+* The `network-namespace-wrapper.sh` script runs on the **remote KVM device**.
+  It creates host-side bridges, veth pairs, and iptables rules.  Bridges and
+  VLAN sub-interfaces live on the **host** (not inside the namespace) so that
+  guest VMs whose NICs are connected to `brethX-<vlan>` reach the namespace
+  gateway without any additional configuration.
+* **VPC networks** share a single namespace per VPC (`cs-vpc-<vpcId>`).  Multiple
+  guest VLANs are each connected via their own veth pair (`vh-<vlan>-<id>` /
+  `vn-<vlan>-<id>`).
+* **Isolated networks** each get their own namespace (`cs-net-<networkId>`).
+* The two scripts are intentionally decoupled: you can replace either script
+  with a custom implementation (Python, Go, etc.) as long as the interface
+  contract (arguments and exit codes) is maintained.
+
+---
+
+## Directory contents
+
+| File | Installed location | Purpose |
+|------|--------------------|---------|
+| `network-namespace.sh` | management server | SSH proxy — executed by `NetworkExtensionElement` |
+| `network-namespace-wrapper.sh` | remote network device | Performs iptables / bridge operations |
+| `README.md` | — | This documentation |
+
+> **Source tree paths:**
+> * `network-namespace.sh` → `extensions/network-namespace/network-namespace.sh`
+> * `network-namespace-wrapper.sh` → `extensions/network-namespace/network-namespace-wrapper.sh`
+
+---
+
+## How it works
+
+### Lifecycle of a CloudStack network operation
+
+1. **CloudStack** decides that a network operation must be applied (e.g.
+   `implement`, `addStaticNat`, `applyPortForwardingRules`).
+2. **`NetworkExtensionElement`** (Java) resolves the extension that is registered
+   on the physical network whose name matches the network's service provider.  It
+   reads all device details stored in `extension_resource_map_details`.
+3. `NetworkExtensionElement` builds a command line:
+   ```
+   <extension_path>/network-namespace.sh <command> <payload-file> <timeout-seconds>
+   ```
+   The payload file includes top-level `physical-network-extension-details`,
+   top-level `network-extension-details`, and command-specific fields under
+   `payload` (except `custom-action`, which is a flat top-level payload).
+4. **`network-namespace.sh`** parses the payload JSON, writes the SSH
+   private key to a temporary file (if `sshkey` is set in the physical-network
+   details), uploads the payload file to the selected host, then runs the wrapper
+   script remotely as `<command> <payload-file> <timeout-seconds>`.
+5. **`network-namespace-wrapper.sh`** parses the payload and executes the
+   requested operation using `ip link`, `iptables`, `ip addr`, etc. inside the
+   network namespace.
+6. Exit codes from `network-namespace.sh`:
+   * `0` — success
+   * `1` — usage / configuration error (missing arguments, no reachable hosts)
+   * `2` — SSH connection or authentication error
+   * `3` — remote wrapper script returned non-zero
+
+   Any non-zero exit causes CloudStack to treat the operation as failed.
+
+### Authentication priority (network-namespace.sh)
+
+1. `sshkey` field in `physical-network-extension-details` — PEM key written
+   to a temp file under `/tmp/.cs-extnet-key-XXXXXX/`, used with `ssh -i`.
+   **Preferred** — the temp file is deleted on exit.
+2. `password` field — passed to `sshpass(1)` if available; `sshpass` must be
+   installed on the management server.
+3. Neither set — relies on the SSH agent or host key on the management server.
+
+### Host selection (`ensure-network-device`)
+
+Before every network operation `NetworkExtensionElement` calls `ensure-network-device`
+on `network-namespace.sh` (locally, **no SSH**).  This selects the KVM host for the
+network:
+
+1. **Sticky re-validation**: if a host was previously selected (from
+   `payload.current_details.host` or `network-extension-details.host`) *and* that
+   host is still in the candidate list *and* still reachable, it is kept.
+2. **Hash-based selection**: for new or failed-over networks a stable preferred index
+   is computed as `CRC32(<routing-key>) mod len(hosts)` where the routing key is
+   `vpc_id` for VPC networks (ensuring all tiers land on the same host) or
+   `network_id` for isolated networks. Hosts are probed in order starting at that
+   index until one answers.
+3. The result is printed as a single-line JSON object:
+   ```json
+   {"host":"192.168.1.10","namespace":"cs-net-42"}
+   ```
+   CloudStack stores this in `network_details.extension.details` and forwards it
+   to later calls through top-level `network-extension-details`.
+
+You can override the remote wrapper path for testing:
+```bash
+CS_NET_SCRIPT_PATH=/custom/path/wrapper.sh network-namespace.sh implement-network ...
+```
+
+---
+
+## Installation
+
+### Management server
+
+During package installation the `network-namespace.sh` script is deployed to:
+
+```
+/usr/share/cloudstack-management/extensions/<extension-name>/<extension-name>.sh
+```
+
+The extension path is set to `network-namespace` at creation time;
+`NetworkExtensionElement` looks for `<extensionName>.sh` inside the directory.
+In **developer mode** the extensions directory defaults to `extensions/` relative
+to the repo root, so `extensions/network-namespace/network-namespace.sh` is
+found automatically.
+
+### Remote network device
+
+Copy `network-namespace-wrapper.sh` to **each** remote device that will act as the
+network gateway, inside a subdirectory named after the extension:
+
+```bash
+# From the CloudStack source tree:
+DEVICE=root@<kvm-host>
+EXT_NAME=network-namespace        # must match the extension name in CloudStack
+
+ssh ${DEVICE} "mkdir -p /etc/cloudstack/extensions/${EXT_NAME}"
+scp extensions/network-namespace/network-namespace-wrapper.sh \
+    ${DEVICE}:/etc/cloudstack/extensions/${EXT_NAME}/${EXT_NAME}-wrapper.sh
+ssh ${DEVICE} "chmod +x /etc/cloudstack/extensions/${EXT_NAME}/${EXT_NAME}-wrapper.sh"
+```
+
+The wrapper derives its state directory and log path from the directory it is
+installed in:
+
+* **State:** `/var/lib/cloudstack/<ext-name>/`
+  (e.g. `/var/lib/cloudstack/network-namespace/`)
+* **Log (wrapper, on KVM host):** `/var/log/cloudstack/extensions/<ext-name>/<ext-name>.log`
+  (e.g. `/var/log/cloudstack/extensions/network-namespace/network-namespace.log`)
+* **Log (proxy, on management server):** `/var/log/cloudstack/extensions/<ext-name>.log`
+  (e.g. `/var/log/cloudstack/extensions/network-namespace.log`)
+
+Additional per-network service logs are also written to the same directory on the
+KVM host: `dnsmasq-<networkId>.log`, `apache2-<networkId>.log`,
+`passwd-<networkId>.log`.
+
+**Prerequisites on the remote device:**
+
+| Package / tool | Purpose |
+|----------------|---------|
+| `iproute2` (`ip`, `ip netns`) | Namespace, bridge, veth, route management |
+| `iptables` + `iptables-save` | NAT and filter rules inside namespace |
+| `arping` | Gratuitous ARP after public IP assignment |
+| `dnsmasq` | DHCP and DNS service inside namespace |
+| `haproxy` | Load balancing inside namespace |
+| `apache2` (Debian/Ubuntu) or `httpd` (RHEL/CentOS) | Metadata / user-data HTTP service (port 80) |
+| `python3` | DHCP options parsing, haproxy config generation, vm-data processing |
+| `util-linux` (`flock`) | Serialise concurrent operations per network |
+| `sshd` | Reachable from the management server on the configured port (default 22) |
+
+The SSH user must have permission to run `ip`, `iptables`, `iptables-save`,
+and `ip netns exec` (root or passwordless `sudo` for those commands).
+
+---
+
+## Step-by-step API setup
+
+All examples below use `cmk` (the CloudStack CLI).  Replace `<zone-uuid>`,
+`<phys-net-uuid>`, etc. with real values from your environment.
+
+### 1. Create the extension
+
+```bash
+cmk createExtension \
+    name=my-extnet \
+    type=NetworkOrchestrator \
+    path=network-namespace \
+    details[0].network.services="SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
+    details[1].network.service.capabilities="{\"SourceNat\":{\"SupportedSourceNatTypes\":\"peraccount\",\"RedundantRouter\":\"false\"},\"Firewall\":{\"TrafficStatistics\":\"per public ip\"}}"
+```
+
+The two details declare which services this extension provides and their
+CloudStack capability values.  These are consulted when listing network service
+providers and when validating network offerings.
+
+**`network.services`** — comma-separated list of service names:
+```
+SourceNat,StaticNat,PortForwarding,Firewall,Gateway
+```
+Valid service names include: `Vpn`, `Dhcp`, `Dns`, `SourceNat`,
+`PortForwarding`, `Lb`, `UserData`, `StaticNat`, `NetworkACL`, `Firewall`,
+`Gateway`, `SecurityGroup`.
+
+**`network.service.capabilities`** — JSON object mapping each service to its
+CloudStack `Capability` key/value pairs:
+```json
+{
+  "SourceNat": {
+    "SupportedSourceNatTypes": "peraccount",
+    "RedundantRouter": "false"
+  },
+  "Firewall": {
+    "TrafficStatistics": "per public ip"
+  }
+}
+```
+
+Services listed in `network.services` that have no entry in
+`network.service.capabilities` (e.g. `StaticNat`, `PortForwarding`,
+`Gateway`) are still offered — CloudStack treats missing capability values as
+"no constraint" and accepts any value when creating the network offering.
+
+If you omit both details entirely, the extension defaults to an empty set of
+services and no capabilities.
+
+> **Backward compatibility:** the old combined `network.capabilities` JSON
+> key (with a `"services"` array and `"capabilities"` object in one blob) is
+> still accepted but deprecated.  Prefer the split keys above.
+
+Verify the extension was created and its state is `Enabled`:
+```bash
+cmk listExtensions name=my-extnet
+```
+
+To enable or disable the extension:
+```bash
+cmk updateExtension id=<ext-uuid> state=Enabled
+cmk updateExtension id=<ext-uuid> state=Disabled
+```
+
+### 2. Register the extension with a physical network
+
+```bash
+cmk registerExtension \
+    id=<extension-uuid> \
+    resourcetype=PhysicalNetwork \
+    resourceid=<phys-net-uuid>
+```
+
+This creates a **Network Service Provider** (NSP) entry named `my-extnet` on the
+physical network and enables it automatically.  The NSP name is the **extension
+name** — not the generic string `NetworkExtension`.
+
+After registering, set the connection details for the remote KVM device(s):
+
+```bash
+cmk updateRegisteredExtension \
+    extensionid=<extension-uuid> \
+    resourcetype=PhysicalNetwork \
+    resourceid=<phys-net-uuid> \
+    "details[0].hosts=192.168.10.1,192.168.10.2" \
+    "details[1].username=root" \
+    "details[2].sshkey=<pem-key-contents>" \
+    "details[3].guest.network.device=eth1" \
+    "details[4].public.network.device=eth1"
+```
+
+> **`network.isolation.method=NetworkExtension`** must be set as an Extension
+> detail (via `createExtension` or `updateExtension`), not as a physical-network
+> registration detail.  The network-namespace extension uses VLAN-based isolation
+> and does not rely on the script output from `implement-network` to override
+> the broadcast domain type, so this detail is not strictly required for basic
+> operation.  It is included here as best practice and for forward
+> compatibility — extensions that return `network.broadcast_domain_type` or
+> `network.broadcast_uri` from `implement-network` **must** set it or those
+> updates will be silently ignored by CloudStack.
+
+The `hosts` value is a comma-separated list of KVM host IPs; `ensure-network-device`
+picks one per network and stores it in `--network-extension-details`.  Use `sshkey`
+(PEM private key) for passwordless authentication, or `password` + `sshpass`.
+
+Verify:
+```bash
+cmk listNetworkServiceProviders physicalnetworkid=<phys-net-uuid>
+# → a provider named "my-extnet" should appear in state Enabled
+```
+
+To disable or re-enable the NSP:
+```bash
+cmk updateNetworkServiceProvider id=<nsp-uuid> state=Disabled
+cmk updateNetworkServiceProvider id=<nsp-uuid> state=Enabled
+```
+
+To unregister:
+```bash
+cmk unregisterExtension \
+    id=<extension-uuid> \
+    resourcetype=PhysicalNetwork \
+    resourceid=<phys-net-uuid>
+```
+
+### 3. Create a network offering
+
+Use the **extension name** (`my-extnet`) as the service provider — not the
+generic string `NetworkExtension`:
+
+```bash
+cmk createNetworkOffering \
+    name="My ExtNet Offering" \
+    displaytext="Isolated network via my-extnet" \
+    guestiptype=Isolated \
+    traffictype=GUEST \
+    supportedservices="SourceNat,StaticNat,PortForwarding,Firewall,Gateway" \
+    "serviceProviderList[0].service=SourceNat"      "serviceProviderList[0].provider=my-extnet" \
+    "serviceProviderList[1].service=StaticNat"      "serviceProviderList[1].provider=my-extnet" \
+    "serviceProviderList[2].service=PortForwarding" "serviceProviderList[2].provider=my-extnet" \
+    "serviceProviderList[3].service=Firewall"       "serviceProviderList[3].provider=my-extnet" \
+    "serviceProviderList[4].service=Gateway"        "serviceProviderList[4].provider=my-extnet" \
+    "serviceCapabilityList[0].service=SourceNat" \
+    "serviceCapabilityList[0].capabilitytype=SupportedSourceNatTypes" \
+    "serviceCapabilityList[0].capabilityvalue=peraccount"
+```
+
+Enable the offering:
+```bash
+cmk updateNetworkOffering id=<offering-uuid> state=Enabled
+```
+
+> The `serviceCapabilityList` entries must match the values declared in the
+> extension's `network.service.capabilities` detail.  If the extension's JSON does
+> not declare a capability value for a service, CloudStack accepts any value (or no
+> value) without error.
+
+### 4. Create an isolated network
+
+```bash
+cmk createNetwork \
+    name=my-network \
+    displaytext="My isolated network" \
+    networkofferingid=<offering-uuid> \
+    zoneid=<zone-uuid>
+```
+
+When a VM is first deployed into this network, CloudStack calls
+`NetworkExtensionElement.implement()`, which triggers the `implement-network` command:
+
+```bash
+# Management server executes:
+network-namespace.sh implement-network \
+    --network-id 42 \
+    --vlan 100 \
+    --gateway 10.0.1.1 \
+    --cidr 10.0.1.0/24
+
+# network-namespace.sh SSHes to the host and runs inside the host:
+network-namespace-wrapper.sh implement-network \
+    --network-id 42 \
+    --vlan 100 \
+    --gateway 10.0.1.1 \
+    --cidr 10.0.1.0/24
+```
+
+The wrapper creates a VLAN sub-interface and Linux bridge, a guest veth pair
+(`vh-100-2a`/`vn-100-2a`), assigns the gateway IP to the namespace veth,
+enables IP forwarding inside the namespace, and creates per-network iptables
+chains: `CS_EXTNET_42_PR` (nat PREROUTING), `CS_EXTNET_42_POST` (nat
+POSTROUTING), and `CS_EXTNET_FWD_42` (filter FORWARD).
+
+> **Note on iptables chains:**
+> | Chain | Table | Purpose |
+> |-------|-------|---------|
+> | `CS_EXTNET_<id>_PR`         | `nat`    | PREROUTING DNAT (port-forward, static-NAT) |
+> | `CS_EXTNET_<id>_POST`       | `nat`    | POSTROUTING SNAT (source-NAT, static-NAT outbound) |
+> | `CS_EXTNET_FWD_<id>`        | `filter` | FORWARD catch-all for this network |
+> | `CS_EXTNET_FWRULES_<id>`    | `filter` | Firewall egress rules (inserted at pos 1 of FWD chain) |
+> | `CS_EXTNET_FWI_<pubIp>`     | `mangle` | Firewall ingress per public IP (PREROUTING, before DNAT) |
+> | `CS_EXTNET_ACL_<id>`        | `filter` | VPC Network ACL (both ingress and egress; pos 1 of FWD) |
+> | `CS_EXTNET_<vpc-id>_VPC_POST` | `nat`  | VPC-level SNAT for entire VPC CIDR |
+
+### 5. Acquire a public IP and enable Source NAT
+
+```bash
+cmk associateIpAddress networkid=<network-uuid>
+```
+
+CloudStack calls `applyIps()` which issues `assign-ip` with `--source-nat true`
+for the source-NAT IP:
+
+```bash
+network-namespace.sh assign-ip \
+    --network-id 42 \
+    --vlan 100 \
+    --public-ip 203.0.113.10 \
+    --source-nat true \
+    --gateway 10.0.1.1 \
+    --cidr 10.0.1.0/24
+```
+
+The wrapper:
+1. Creates public VLAN sub-interface `eth1.<pvlan>` and bridge `breth1-<pvlan>` on the host.
+2. Creates veth pair `vph-<pvlan>-42` (host, in bridge) / `vpn-<pvlan>-42` (namespace).
+3. Assigns `203.0.113.10/32` to `vpn-<pvlan>-42` **inside the namespace**.
+4. Adds host route `203.0.113.10/32 dev vph-<pvlan>-42` so the host can reach it.
+5. Adds an iptables SNAT rule in `CS_EXTNET_42_POST`: traffic from `10.0.1.0/24`
+   out `vpn-<pvlan>-42` → source `203.0.113.10`.
+6. Adds an iptables FORWARD ACCEPT rule in `CS_EXTNET_FWD_42` for the guest CIDR.
+7. If `--public-gateway` is set, adds/replaces the namespace default route via
+   `vpn-<pvlan>-42`.
+
+When the IP is released (via `disassociateIpAddress`), `release-ip` is called,
+which removes all associated rules and the IP address.
+
+### 6. Enable / disable Static NAT
+
+```bash
+# Enable static NAT: map public IP 203.0.113.20 to VM private IP 10.0.1.5
+cmk enableStaticNat \
+    ipaddressid=<public-ip-uuid> \
+    virtualmachineid=<vm-uuid> \
+    networkid=<network-uuid>
+```
+
+CloudStack calls `applyStaticNats()` → `add-static-nat`:
+
+```bash
+network-namespace.sh add-static-nat \
+    --network-id 42 \
+    --vlan 100 \
+    --public-ip 203.0.113.20 \
+    --private-ip 10.0.1.5
+```
+
+iptables rules added (all run inside the namespace via `ip netns exec`):
+```bash
+# DNAT inbound  (CS_EXTNET_42_PR = nat PREROUTING chain)
+iptables -t nat -A CS_EXTNET_42_PR -d 203.0.113.20 -j DNAT --to-destination 10.0.1.5
+# SNAT outbound  (CS_EXTNET_42_POST = nat POSTROUTING chain)
+iptables -t nat -A CS_EXTNET_42_POST -s 10.0.1.5 -o vpn-<pvlan>-42 -j SNAT --to-source 203.0.113.20
+# FORWARD inbound + outbound  (CS_EXTNET_FWD_42 = filter FORWARD chain)
+iptables -t filter -A CS_EXTNET_FWD_42 -d 10.0.1.5 -o vn-100-2a -j ACCEPT
+iptables -t filter -A CS_EXTNET_FWD_42 -s 10.0.1.5 -i vn-100-2a -j ACCEPT
+```
+
+```bash
+# Disable static NAT
+cmk disableStaticNat ipaddressid=<public-ip-uuid>
+```
+
+CloudStack calls `delete-static-nat`, which removes all four rules above.
+
+### 7. Add / delete Port Forwarding
+
+```bash
+# Forward TCP port 2222 on public IP 203.0.113.20 → VM port 22
+cmk createPortForwardingRule \
+    ipaddressid=<public-ip-uuid> \
+    privateport=22 \
+    publicport=2222 \
+    protocol=TCP \
+    virtualmachineid=<vm-uuid> \
+    networkid=<network-uuid>
+```
+
+CloudStack calls `applyPFRules()` → `add-port-forward`:
+
+```bash
+network-namespace.sh add-port-forward \
+    --network-id 42 \
+    --vlan 100 \
+    --public-ip 203.0.113.20 \
+    --public-port 2222 \
+    --private-ip 10.0.1.5 \
+    --private-port 22 \
+    --protocol TCP
+```
+
+iptables rules added (inside the namespace):
+```bash
+# DNAT inbound  (CS_EXTNET_42_PR = nat PREROUTING chain)
+iptables -t nat -A CS_EXTNET_42_PR -p tcp -d 203.0.113.20 --dport 2222 \
+    -j DNAT --to-destination 10.0.1.5:22
+# FORWARD  (CS_EXTNET_FWD_42 = filter FORWARD chain)
+iptables -t filter -A CS_EXTNET_FWD_42 -p tcp -d 10.0.1.5 --dport 22 \
+    -o vn-100-2a -j ACCEPT
+```
+
+Port ranges (e.g. `80:90`) are supported and passed verbatim to iptables `--dport`.
+
+```bash
+# Delete the rule
+cmk deletePortForwardingRule id=<rule-uuid>
+```
+
+This calls `delete-port-forward` which removes the DNAT and FORWARD rules.
+
+### 8. Delete the network
+
+```bash
+cmk deleteNetwork id=<network-uuid>
+```
+
+CloudStack calls `shutdown-network` (to clean up active state) then
+`destroy-network` (full removal):
+
+```bash
+network-namespace.sh shutdown-network --network-id 42 --vlan 100
+network-namespace.sh destroy-network  --network-id 42 --vlan 100
+```
+
+**`shutdown-network`** wrapper actions:
+1. Removes iptables jump rules and flushes/deletes per-network chains
+   (`CS_EXTNET_42_PR`, `CS_EXTNET_42_POST`, `CS_EXTNET_FWD_42`).
+2. Stops dnsmasq, haproxy, apache2, and password-server processes.
+3. Deletes public veth pairs (`vph-<pvlan>-42` / `vpn-<pvlan>-42`) that were
+   created during `assign-ip` (read from state files).
+4. Deletes the guest veth host-side (`vh-100-2a`).
+5. For **isolated** networks: deletes the namespace `cs-net-42`.
+6. For **VPC tier** networks: preserves the shared namespace `cs-vpc-<vpcId>`.
+
+**`destroy-network`** wrapper actions (similar to `shutdown-network`, plus):
+1. Deletes the guest veth host-side (`vh-100-2a`).
+2. Deletes public veth pairs owned by this tier.
+3. Stops per-network services.
+4. Removes per-network state directory `/var/lib/cloudstack/<ext-name>/network-42/`.
+5. For **isolated** networks: deletes the namespace `cs-net-42`.
+6. For **VPC tier** networks: deregisters this tier from the VPC — namespace is
+   only removed by a subsequent `destroy-vpc` call.
+
+> The host bridge `breth1-100` and VLAN sub-interface `eth1.100` are removed
+> once nothing else is attached to the bridge (checked via
+> `teardown_host_bridge_if_unused`). If another network/tenant is still
+> sharing the same physical VLAN, or a VM tap is still attached, the bridge
+> and VLAN sub-interface are left in place.
+
+### 9. Unregister and delete the extension
+
+```bash
+# Disable and delete the NSP
+cmk updateNetworkServiceProvider id=<nsp-uuid> state=Disabled
+cmk deleteNetworkServiceProvider id=<nsp-uuid>
+
+# Remove external network device credentials (if any)
+# Device credentials are stored as extension_resource_map_details for the
+# extension registration. Remove or update them via `updateRegisteredExtension`
+# (set cleanupdetails=true to wipe all details) or by supplying new details.
+# Example: clear all registration details for a physical network:
+cmk updateRegisteredExtension \
+    extensionid=<extension-uuid> \
+    resourcetype=PhysicalNetwork \
+    resourceid=<phys-net-uuid> \
+    cleanupdetails=true
+
+# Unregister the extension from the physical network
+cmk unregisterExtension \
+    id=<extension-uuid> \
+    resourcetype=PhysicalNetwork \
+    resourceid=<phys-net-uuid>
+
+# Delete the extension
+# (only possible once it is unregistered from all physical networks)
+cmk deleteExtension id=<extension-uuid>
+```
+
+---
+
+## Multiple extensions on the same physical network
+
+Because each extension is registered as its own NSP (named after the extension),
+multiple independent external network providers can coexist on the same physical
+network:
+
+```bash
+# Register two extensions, each backed by a different device
+cmk registerExtension id=<ext-a-uuid> resourcetype=PhysicalNetwork resourceid=<pn-uuid>
+cmk registerExtension id=<ext-b-uuid> resourcetype=PhysicalNetwork resourceid=<pn-uuid>
+
+# Store device connection details as registration details for each extension.
+# Details are stored in extension_resource_map_details for the registration.
+# Example: set hosts and guest/public network devices for ext-a on the physical network:
+cmk updateRegisteredExtension \
+    extensionid=<ext-a-uuid> \
+    resourcetype=PhysicalNetwork \
+    resourceid=<pn-uuid> \
+    "details[0].hosts=10.0.0.1,10.0.0.2" \
+    "details[1].guest.network.device=eth1" \
+    "details[2].public.network.device=eth1"
+```
+
+When creating network offerings, reference the specific extension name:
+
+```bash
+# Network offering backed by ext-a-name
+cmk createNetworkOffering ... \
+    "serviceProviderList[0].provider=ext-a-name" ...
+
+# Network offering backed by ext-b-name
+cmk createNetworkOffering ... \
+    "serviceProviderList[0].provider=ext-b-name" ...
+```
+
+CloudStack resolves which extension to call by:
+1. Looking up the service provider name stored in `ntwk_service_map` for the
+   guest network.
+2. Finding the registered extension on the physical network whose name matches
+   that provider name.
+3. Calling `NetworkExtensionElement` scoped to that specific provider/extension
+   (via `NetworkExtensionElement.withProviderName()`).
+
+---
+
+## IPv6 support
+
+The network-namespace extension supports IPv6 guest networks via stateless address auto-configuration
+(SLAAC) using **radvd** (Router Advertisement Daemon), mirroring the approach used by CloudStack's
+built-in VPC router (`CsVpcGuestNetwork.py`).
+
+### How it works
+
+When `network_ip6_gateway` and `network_ip6_cidr` are present in the `implement-network` payload:
+
+1. **`implement-network`** enables IPv6 in the namespace (`net.ipv6.conf.all.disable_ipv6=0`,
+   forwarding on, DAD and temporary addresses disabled) and assigns the IPv6 gateway address
+   to the guest veth interface inside the namespace.
+2. **`config-dhcp-subnet`** or **`config-dns-subnet`** writes `/radvd/radvd.conf` and starts
+   radvd inside the namespace.  radvd sends Router Advertisements on the guest veth, advertising
+   the `/64` (or configured) prefix so VMs can self-configure via SLAAC.
+3. **`add-dns-entry`** adds both an A record (IPv4) and an AAAA record (IPv6, from `ip6_address`)
+   to the dnsmasq hosts file so guests can resolve VM hostnames over IPv6.
+4. **`remove-dhcp-subnet`** / **`shutdown-network`** / **`destroy-network`** stops radvd and
+   removes its state directory.
+
+### radvd configuration
+
+The generated `radvd.conf` follows the same format as `CsVpcGuestNetwork.py`:
+
+```
+interface <guest-veth>
+{
+    AdvSendAdvert on;
+    MinRtrAdvInterval 5;
+    MaxRtrAdvInterval 15;
+    prefix <network_ip6_gateway>/<prefix-len>
+    {
+        AdvOnLink on;
+        AdvAutonomous on;
+    };
+    RDNSS <dns6-server>          # one block per server from dns6
+    {
+        AdvRDNSSLifetime 30;
+    };
+};
+```
+
+### VPC networks
+
+For VPC networks the shared namespace is created by `implement-vpc` (IPv6-neutral — no IPv6 is
+enabled or disabled at that stage).  Each VPC tier network runs its own `implement-network`, which
+independently enables or disables IPv6 on its own guest veth.  This allows mixed VPC topologies
+where some tiers have IPv6 and others do not.
+
+Each IPv6 tier also runs its own **radvd** instance inside the shared namespace, bound to its own
+guest veth.  radvd correctly handles multiple instances in the same namespace as long as each
+instance is bound to a distinct interface.
+
+### State files
+
+IPv6 state is persisted under the per-network state directory:
+
+| File | Content |
+|------|---------|
+| `network-<id>/ip6-gateway` | IPv6 gateway address assigned to the namespace veth |
+| `network-<id>/ip6-cidr` | IPv6 CIDR of the guest subnet |
+| `network-<id>/dns6` | Comma-separated IPv6 DNS server list (RDNSS) |
+| `network-<id>/radvd/radvd.conf` | Generated radvd configuration |
+| `network-<id>/radvd/radvd.pid` | PID of the running radvd process |
+
+---
+
+## Wrapper script operations reference
+
+CloudStack now invokes the wrapper through payload files.
+
+The `network-namespace-wrapper.sh` script runs on the remote KVM device.
+It receives the command as its first positional argument followed by named
+`--option value` pairs.
+
+All commands:
+* Write timestamped entries to `/var/log/cloudstack/extensions/<ext-name>/<ext-name>.log`.
+* Use a per-network flock file (`${STATE_DIR}/lock-network-<id>`) — or
+  `lock-vpc-<id>` for VPC networks — to serialise concurrent operations.
+* Persist state under `/var/lib/cloudstack/<ext-name>/network-<network-id>/`
+  (or `vpc-<vpc-id>/` for VPC-wide shared state such as public IPs).
+
+### `implement-network`
+
+Called when CloudStack activates the network (typically on first VM deploy).
+
+```
+network-namespace-wrapper.sh implement-network \
+    --network-id <id> \
+    --vlan <vlan-id>       \
+    --gateway <gateway-ip> \
+    --cidr <cidr>          \
+    [--extension-ip <ext-ip>] \
+    [--vpc-id <vpc-id>]
+```
+
+Actions:
+1. Create namespace `cs-vpc-<vpc-id>` (VPC) or `cs-net-<network-id>` (isolated).
+2. Resolve `GUEST_ETH` from `guest.network.device` in `physical-network-extension-details`
+   (defaults to `eth1` when absent).
+3. Create VLAN sub-interface `GUEST_ETH.<vlan>` on the host.
+4. Create host bridge `br<GUEST_ETH>-<vlan>` and attach `GUEST_ETH.<vlan>` to it.
+5. Create veth pair `vh-<vlan>-<id>` (host, in bridge) / `vn-<vlan>-<id>` (namespace).
+6. Assign `<extension-ip>/<prefix>` (or `<gateway>/<prefix>` when
+   `--extension-ip` is not given) to `vn-<vlan>-<id>` inside the namespace.
+   When the extension IP differs from the gateway a default route via the gateway
+   is also added inside the namespace.
+7. IPv6 handling:
+   - When `--network-ip6-gateway` / `--network-ip6-cidr` are provided: enable IPv6 forwarding
+     inside the namespace (disable DAD, enable forwarding and accept_ra) and assign the IPv6
+     gateway address to `vn-<vlan>-<id>`.
+   - When no IPv6 is configured: disable IPv6 on the guest veth interface.
+     For standalone networks the global namespace disable is also applied; for VPC tier networks
+     the global setting is left unchanged to avoid clobbering sibling tiers that may have IPv6.
+8. Enable IPv4 IP forwarding inside the namespace.
+9. Create iptables chains `CS_EXTNET_<id>_PR` (nat PREROUTING DNAT),
+   `CS_EXTNET_<id>_POST` (nat POSTROUTING SNAT), and `CS_EXTNET_FWD_<id>` (filter FORWARD).
+10. Save VLAN, gateway, CIDR, extension-ip, IPv6 gateway, IPv6 CIDR, and namespace to state files.
+
+### `shutdown-network`
+
+Called when a network is shut down (may be restarted later).
+
+```
+network-namespace-wrapper.sh shutdown-network \
+    --network-id <id> [--vlan <vlan-id>] [--vpc-id <vpc-id>]
+```
+
+Actions:
+1. Remove iptables jump rules for this network and flush/delete its chains
+   (`CS_EXTNET_<id>_PR`, `CS_EXTNET_<id>_POST`, `CS_EXTNET_FWD_<id>`).
+2. Delete public veth pairs (`vph-<pvlan>-<id>` / `vpn-<pvlan>-<id>`) that are
+   owned by this tier (guarded by per-IP `.tier` state files).
+3. Delete the guest veth host-side (`vh-<vlan>-<id>`).
+4. Stop dnsmasq, haproxy, apache2, and password-server processes.
+5. For **isolated** networks: delete the namespace `cs-net-<id>`.
+6. For **VPC tier** networks: preserve the shared namespace `cs-vpc-<vpc-id>`.
+
+### `destroy-network`
+
+Called when the network is permanently removed.
+
+```
+network-namespace-wrapper.sh destroy-network \
+    --network-id <id> [--vlan <vlan-id>] [--vpc-id <vpc-id>]
+```
+
+Actions:
+1. Delete guest veth host-side (`vh-<vlan>-<id>`).
+2. Delete public veth pairs that belong to this tier (guarded by `.tier` state files).
+3. Stop dnsmasq, haproxy, apache2, and password-server processes.
+4. Remove per-network state directory `network-<id>/`.
+5. For **isolated** networks: delete the namespace `cs-net-<id>`.
+6. For **VPC tier** networks: deregister this tier from the VPC tracking directory
+   (`vpc-<vpc-id>/tiers/<network-id>`) — the namespace is preserved and will be
+   removed by a subsequent `destroy-vpc` call.
+
+> The host bridge `br<GUEST_ETH>-<vlan>` and VLAN sub-interface `GUEST_ETH.<vlan>`
+> are removed on destroy once the bridge has no remaining member interfaces
+> (`teardown_host_bridge_if_unused`). This is a no-op if another network/tenant
+> is still sharing the same physical VLAN, or a VM tap is still attached.
+
+### VPC lifecycle commands: `implement-vpc`, `update-vpc-source-nat-ip`, `shutdown-vpc`, `destroy-vpc`
+
+These commands manage VPC-level state. Called by `NetworkExtensionElement` when
+implementing, shutting down, or destroying a VPC (before or after per-tier
+network operations).
+
+#### `implement-vpc`
+
+```
+network-namespace-wrapper.sh implement-vpc \
+    --vpc-id <vpc-id> \
+    [--vpc-cidr <vpc-cidr>] \
+    [--public-ip <ip>] [--public-vlan <pvlan>] \
+    [--public-gateway <gw>] [--public-cidr <cidr>] \
+    [--source-nat true|false]
+```
+
+Actions:
+1. Create the shared VPC namespace `cs-vpc-<vpc-id>` (idempotent).
+2. Enable IPv4 IP forwarding inside the namespace.
+   IPv6 is managed per-tier by `implement-network` (each tier enables or disables IPv6 on its
+   own guest veth without affecting sibling tiers).
+3. Optionally, when `--source-nat true`, `--public-ip`, and `--public-vlan` are all
+   provided and `--vpc-cidr` (VPC CIDR) is given:
+   * Create public veth pair `vph-<pvlan>-<vpc-id>` (host) / `vpn-<pvlan>-<vpc-id>` (namespace).
+   * Assign `<public-ip>` to `vpn-<pvlan>-<vpc-id>` inside the namespace.
+   * Set namespace default route via `--public-gateway` (if given).
+   * Add VPC-level SNAT rule in chain `CS_EXTNET_<vpc-id>_VPC_POST`:
+     all VPC traffic (`<vpc-cidr>`) out `vpn-<pvlan>-<vpc-id>` → `<public-ip>`.
+4. Save VPC namespace name and CIDR to
+   `/var/lib/cloudstack/<ext-name>/vpc-<vpc-id>/`.
+
+> This command runs **before** any tier networks are implemented. Tier networks
+> inherit the same namespace.
+
+#### `update-vpc-source-nat-ip`
+
+```
+network-namespace-wrapper.sh update-vpc-source-nat-ip \
+    --vpc-id <vpc-id> \
+    --public-ip <new-source-nat-ip> \
+    [--vpc-cidr <vpc-cidr>] \
+    [--public-vlan <pvlan>] \
+    [--public-gateway <gw>] \
+    [--public-cidr <cidr>] \
+    [--source-nat true|false]
+```
+
+Actions:
+1. Ensure the target public veth pair exists (`vph-<pvlan>-<vpc-id>` / `vpn-<pvlan>-<vpc-id>`) and assign the new public IP inside the VPC namespace.
+2. Update host and namespace routes for the new source NAT egress path:
+   * keep host route `<public-ip>/32` via `vph-<pvlan>-<vpc-id>`
+   * replace namespace default route via `--public-gateway` on `vpn-<pvlan>-<vpc-id>` when provided.
+3. Rebuild VPC SNAT chain `CS_EXTNET_<vpc-id>_VPC_POST` so exactly one SNAT rule remains:
+   * `-s <vpc-cidr> -o vpn-<pvlan>-<vpc-id> -j SNAT --to-source <public-ip>`.
+4. Reconcile persisted VPC IP markers under
+   `/var/lib/cloudstack/<ext-name>/vpc-<vpc-id>/ips/`:
+   * set the new source NAT IP file to `true`
+   * set all other VPC public IP marker files to `false`
+   * persist/update `<ip>.pvlan` for the new source NAT IP.
+
+> This command is used by `NetworkExtensionElement.updateVpcSourceNatIp()` when
+> `updateVPC` is called with `sourcenatipaddress`; it avoids full VPC restart.
+
+#### `shutdown-vpc`
+
+```
+network-namespace-wrapper.sh shutdown-vpc \
+    --vpc-id <vpc-id>
+```
+
+Actions:
+1. Delete the VPC namespace `cs-vpc-<vpc-id>` (which removes all interfaces
+   inside it, including per-tier veth pairs).
+
+> Called after all tier networks have been shut down. The namespace itself is the
+> only resource removed — any host-side bridges and VLAN sub-interfaces are left
+> intact.
+
+#### `destroy-vpc`
+
+```
+network-namespace-wrapper.sh destroy-vpc \
+    --vpc-id <vpc-id>
+```
+
+Actions:
+1. Delete the VPC namespace `cs-vpc-<vpc-id>` (if it still exists).
+2. Remove VPC-wide state directory `/var/lib/cloudstack/<ext-name>/vpc-<vpc-id>/`.
+
+> This is the final cleanup step; after this, all VPC namespace state is gone.
+
+### `assign-ip`
+
+Called when a public IP is associated with the network (including source NAT).
+
+```
+network-namespace-wrapper.sh assign-ip \
+    --network-id <id>          \
+    --vlan <guest-vlan>        \
+    --public-ip <ip>           \
+    --source-nat true|false    \
+    --gateway <guest-gw>       \
+    --cidr <guest-cidr>        \
+    --public-vlan <pvlan>      \
+    [--public-gateway <pub-gw>] \
+    [--public-cidr <pub-cidr>]  \
+    [--vpc-id <vpc-id>]
+```
+
+Actions:
+1. Resolve `PUB_ETH` from `public.network.device` in `physical-network-extension-details`
+   (defaults to `eth1` when absent).
+2. Create VLAN sub-interface `PUB_ETH.<pvlan>` and bridge `br<PUB_ETH>-<pvlan>` on the host.
+3. Create veth pair `vph-<pvlan>-<id>` (host) / `vpn-<pvlan>-<id>` (namespace).
+   Attach host end to `br<PUB_ETH>-<pvlan>`.
+4. Assign `<public-ip>/32` (or `/<prefix>` if `--public-cidr` given) to
+   `vpn-<pvlan>-<id>` inside the namespace.
+5. Add host route `<public-ip>/32 dev vph-<pvlan>-<id>` so the host can reach it.
+6. Send a gratuitous ARP (`arping -U`) from `vpn-<pvlan>-<id>` to flush stale ARP
+   entries in the upstream gateway (requires `arping` installed on the KVM host;
+   skipped silently when not available).
+7. If `--public-gateway` is given, set/replace namespace default route via
+   `vpn-<pvlan>-<id>`.
+8. If `--source-nat true` (and `--vpc-id` is **not** set):
+   * SNAT rule: `<guest-cidr>` out `vpn-<pvlan>-<id>` → `<public-ip>`
+     (POSTROUTING chain `CS_EXTNET_<id>_POST`).
+   * FORWARD ACCEPT for `<guest-cidr>` towards `vpn-<pvlan>-<id>`.
+   * For VPC tiers (`--vpc-id` present), SNAT is managed by `implement-vpc` —
+     `assign-ip` skips the SNAT rules.
+9. Save public VLAN to state file `ips/<public-ip>.pvlan` and owning tier to
+   `ips/<public-ip>.tier` (used by `add-static-nat`, `add-port-forward`, `release-ip`).
+
+### `release-ip`
+
+Called when a public IP is released / disassociated from the namespace.
+
+```
+network-namespace-wrapper.sh release-ip \
+    --network-id <id>    \
+    --public-ip <ip>     \
+    [--public-vlan <pvlan>]   \
+    [--public-cidr <pub-cidr>] \
+    [--vpc-id <id>]
+```
+
+Actions:
+1. Load `public_vlan` from `ips/<public-ip>.pvlan` state file.
+2. Remove SNAT rule for guest CIDR → `<public-ip>`.
+3. Remove any DNAT rules targeting `<public-ip>` from PREROUTING chain.
+4. Remove host route `<public-ip>/32`.
+5. Remove IP address from `vpn-<pvlan>-<id>` inside namespace.
+6. If no other IPs share the same `<pvlan>/<id>` combination, delete
+   `vph-<pvlan>-<id>` (host veth), then attempt to remove the public bridge
+   `br<PUB_ETH>-<pvlan>` and VLAN sub-interface `PUB_ETH.<pvlan>` — a no-op
+   (`teardown_host_bridge_if_unused`) if another network/tenant is still
+   sharing the same public VLAN.
+7. Remove state files.
+
+### `add-static-nat`
+
+Called when Static NAT (one-to-one NAT) is enabled for a public IP.
+
+```
+network-namespace-wrapper.sh add-static-nat \
+    --network-id <id>          \
+    --vlan <guest-vlan>        \
+    --public-ip <public-ip>    \
+    --private-ip <private-ip>  \
+    [--vpc-id <vpc-id>]
+```
+
+The `public_vlan` for this IP is loaded from `ips/<public-ip>.pvlan` state
+(written during `assign-ip`).
+
+iptables rules added (chains `CS_EXTNET_<id>_PR` / `_POST` / `FWD_<id>`):
+
+| Table | Chain | Rule |
+|-------|-------|------|
+| `nat` | `CS_EXTNET_<id>_PR`   | `-d <public-ip> -j DNAT --to-destination <private-ip>` |
+| `nat` | `CS_EXTNET_<id>_POST` | `-s <private-ip> -o vpn-<pvlan>-<id> -j SNAT --to-source <public-ip>` |
+| `filter` | `CS_EXTNET_FWD_<id>` | `-d <private-ip> -o vn-<vlan>-<id> -j ACCEPT` |
+| `filter` | `CS_EXTNET_FWD_<id>` | `-s <private-ip> -i vn-<vlan>-<id> -j ACCEPT` |
+
+State saved to `${STATE_DIR}/network-<id>/static-nat/<public-ip>`.
+
+### `delete-static-nat`
+
+```
+network-namespace-wrapper.sh delete-static-nat \
+    --network-id <id> \
+    --public-ip <public-ip> \
+    [--private-ip <private-ip>]
+```
+
+Removes all four rules added by `add-static-nat`.  If `--private-ip` is omitted,
+it is read from the state file.
+
+### `add-port-forward`
+
+Called when a Port Forwarding rule is added.
+
+```
+network-namespace-wrapper.sh add-port-forward \
+    --network-id <id> \
+    --vlan <vlan-id> \
+    --public-ip <public-ip> \
+    --public-port <port-or-range> \
+    --private-ip <private-ip> \
+    --private-port <port-or-range> \
+    --protocol tcp|udp
+```
+
+iptables rules added (inside the namespace):
+
+| Table | Chain | Rule |
+|-------|-------|------|
+| `nat` | `CS_EXTNET_<id>_PR` | `-p <proto> -d <public-ip> --dport <public-port> -j DNAT --to-destination <private-ip>:<private-port>` |
+| `filter` | `CS_EXTNET_FWD_<id>` | `-p <proto> -d <private-ip> --dport <private-port> -o vn-<vlan>-<id> -j ACCEPT` |
+
+Port ranges (`80:90`) are passed verbatim to iptables `--dport`.
+
+State saved to
+`${STATE_DIR}/network-<id>/port-forward/<proto>_<public-ip>_<public-port>`.
+
+### `delete-port-forward`
+
+```
+network-namespace-wrapper.sh delete-port-forward \
+    --network-id <id> \
+    --public-ip <public-ip> \
+    --public-port <port-or-range> \
+    --private-ip <private-ip> \
+    --private-port <port-or-range> \
+    --protocol tcp|udp
+```
+
+Removes the DNAT and FORWARD rules added by `add-port-forward`.
+
+### `prepare-nic`
+
+Called when a VM NIC is being attached to the network (before the VM boots).
+
+```
+network-namespace-wrapper.sh prepare-nic \
+    --network-id <id>       \
+    --vlan <vlan-id>        \
+    --mac <mac>             \
+    --ip <vm-ip>            \
+    [--hostname <name>]     \
+    [--default-nic true|false] \
+    [--gateway <gw>]        \
+    [--cidr <cidr>]         \
+    [--extension-ip <ip>]   \
+    [--vpc-id <vpc-id>]
+```
+
+Actions (all idempotent; silently skipped when the service is not yet configured):
+1. If dnsmasq DHCP is active for the network — add a static lease
+   `<mac>,<ip>[,<hostname>],infinite` to the hosts file.  For secondary NICs
+   (`default_nic=false`) the gateway DHCP option is suppressed via a
+   `set:norouter_<mac_tag>` tag so the VM does not receive a competing default
+   route from this NIC.
+2. If dnsmasq DNS is active — add a `<ip> <hostname>` line to the hosts file.
+3. Sends a SIGHUP / reload to dnsmasq so the new entries take effect
+   immediately.
+
+### `release-nic`
+
+Called when a VM NIC is being detached from the network (after the VM stops).
+
+```
+network-namespace-wrapper.sh release-nic \
+    --network-id <id>  \
+    --mac <mac>        \
+    --ip <vm-ip>       \
+    [--vpc-id <vpc-id>]
+```
+
+Actions:
+1. Remove the MAC's DHCP static lease and any associated gateway-suppression
+   option from dnsmasq.
+2. Remove the VM's hostname from the dnsmasq hosts file.
+3. Reload dnsmasq.
+4. Delete the per-VM metadata directory
+   `${STATE_DIR}/network-<id>/metadata/<vm-ip>/`.
+5. Remove the VM's password entry from the passwords file.
+
+### `apply-fw-rules`
+
+Called when CloudStack applies or removes firewall rules for the network.
+
+```
+network-namespace-wrapper.sh apply-fw-rules \
+    --network-id <id> \
+    --vlan <vlan-id> \
+    [--vpc-id <vpc-id>]
+```
+
+The `fw_rules` field in the payload is a JSON object:
+```json
+{
+  "default_egress_allow": true,
+  "cidr": "10.0.1.0/24",
+  "rules": [
+    {
+      "type": "ingress",
+      "protocol": "tcp",
+      "portStart": 22,
+      "portEnd": 22,
+      "publicIp": "203.0.113.10",
+      "sourceCidrs": ["0.0.0.0/0"]
+    },
+    {
+      "type": "egress",
+      "protocol": "all",
+      "sourceCidrs": ["0.0.0.0/0"]
+    }
+  ]
+}
+```
+
+iptables design (two independent parts, both inside the namespace):
+
+* **Ingress** (mangle PREROUTING, per public IP):
+  Per-public-IP chains `CS_EXTNET_FWI_<pubIp>` check traffic *before* DNAT so
+  the match is against the real public destination IP.  Traffic not matched by
+  explicit ALLOW rules is dropped.
+
+* **Egress** (filter FORWARD, chain `CS_EXTNET_FWRULES_<networkId>`):
+  Inserted at position 1 of `CS_EXTNET_FWD_<networkId>`.  Applies the
+  `default_egress_allow` policy (allow-by-default or deny-by-default) to VM
+  outbound traffic on `-i vn-<vlan>-<id>`.
+
+### `apply-network-acl`
+
+Apply Network ACL (Access Control List) rules for VPC networks.
+
+```
+network-namespace-wrapper.sh apply-network-acl \
+    --network-id <id> \
+    --vlan <vlan-id> \
+    [--vpc-id <vpc-id>]
+```
+
+The `acl_rules` field in the payload is a JSON array of ACL rule objects:
+```json
+[
+  {
+    "id": 1,
+    "number": 100,
+    "trafficType": "Ingress",
+    "action": "Allow",
+    "protocol": "tcp",
+    "portStart": 80,
+    "portEnd": 80,
+    "sourceCidrs": ["0.0.0.0/0"]
+  },
+  {
+    "id": 2,
+    "number": 200,
+    "trafficType": "Egress",
+    "action": "Allow",
+    "protocol": "all",
+    "destCidrs": ["0.0.0.0/0"]
+  }
+]
+```
+
+iptables design:
+
+* A single **filter FORWARD** chain `CS_EXTNET_ACL_<networkId>` handles both
+  ingress and egress traffic.  It is inserted at position 1 of
+  `CS_EXTNET_FWD_<networkId>` so ACL rules take precedence over catch-all ACCEPT
+  rules.
+* `RELATED,ESTABLISHED` traffic is always accepted first (so active sessions are
+  not interrupted).
+* Rules are applied in ascending `number` order.
+* **Ingress rules** (`trafficType: Ingress`) match `-o vn-<vlan>-<id>` (traffic
+  going *into* the VM subnet, optionally filtered by `-d <tier-cidr>`).
+* **Egress rules** (`trafficType: Egress`) match `-i vn-<vlan>-<id>` (traffic
+  *from* the VM subnet, with `sourceCidrs` used as destination filter `-d`).
+* A terminal DROP rule at the end of the chain enforces the implicit deny policy.
+
+### `config-dhcp-subnet` / `remove-dhcp-subnet`
+
+Configure or tear down dnsmasq DHCP service for the network inside the namespace.
+
+**`config-dhcp-subnet` arguments:**
+```
+network-namespace-wrapper.sh config-dhcp-subnet \
+    --network-id <id>      \
+    --gateway <gw>         \
+    --cidr <cidr>          \
+    [--dns <dns-server>]   \
+    [--domain <domain>]    \
+    [--vpc-id <vpc-id>]
+```
+
+Actions: writes a dnsmasq configuration file under
+`${STATE_DIR}/network-<id>/dnsmasq/` and starts or reloads the dnsmasq process
+inside the namespace.  DNS on port 53 is **disabled** by `config-dhcp-subnet`
+(use `config-dns-subnet` to enable it).
+
+**`remove-dhcp-subnet` arguments:**
+```
+network-namespace-wrapper.sh remove-dhcp-subnet --network-id <id>
+```
+
+Actions: stops dnsmasq and removes the dnsmasq configuration directory.
+
+### `add-dhcp-entry` / `remove-dhcp-entry`
+
+Add or remove a static DHCP host reservation (MAC → IP mapping) from dnsmasq.
+
+```
+network-namespace-wrapper.sh add-dhcp-entry \
+    --network-id <id>    \
+    --mac <mac>          \
+    --ip <vm-ip>         \
+    [--hostname <name>]  \
+    [--default-nic true|false]
+```
+
+When `--default-nic false`, the DHCP option 3 (default gateway) is suppressed
+for that MAC so the VM does not get a competing default route via a secondary NIC.
+
+```
+network-namespace-wrapper.sh remove-dhcp-entry \
+    --network-id <id> \
+    --mac <mac>
+```
+
+### `set-dhcp-options`
+
+Set extra DHCP options for a specific NIC (identified by `--nic-id`) using a
+JSON map of option-code → value pairs.
+
+```
+network-namespace-wrapper.sh set-dhcp-options \
+    --network-id <id>           \
+    --nic-id <nic-id>           \
+    --options '{"119":"example.com"}'
+```
+
+### `config-dns-subnet` / `remove-dns-subnet`
+
+Enable or disable DNS (port 53) in the dnsmasq instance.
+
+```
+network-namespace-wrapper.sh config-dns-subnet \
+    --network-id <id>    \
+    --gateway <gw>       \
+    --cidr <cidr>        \
+    [--extension-ip <ip>] \
+    [--domain <domain>]  \
+    [--vpc-id <vpc-id>]
+```
+
+Actions: like `config-dhcp-subnet` but enables DNS on port 53.  Also registers a
+`data-server` hostname entry (using `--extension-ip` if provided, otherwise
+`--gateway`) for metadata service discovery.
+
+```
+network-namespace-wrapper.sh remove-dns-subnet --network-id <id>
+```
+
+Actions: disables DNS (rewrites config to disable port 53) but keeps DHCP running.
+
+### `add-dns-entry` / `remove-dns-entry`
+
+Add or remove a hostname → IP mapping in the dnsmasq hosts file.
+
+```
+network-namespace-wrapper.sh add-dns-entry \
+    --network-id <id>   \
+    --ip <vm-ip>        \
+    --hostname <name>
+
+network-namespace-wrapper.sh remove-dns-entry \
+    --network-id <id> \
+    --ip <vm-ip>
+```
+
+### `save-vm-data`
+
+Write the full VM metadata/userdata/password set for a VM in a single call.
+Called on network restart and VM deploy.
+
+```
+network-namespace-wrapper.sh save-vm-data \
+    --network-id <id>  \
+    --ip <vm-ip>
+```
+
+The `vm_data` field in the payload is a JSON array of `{dir, file, content}`
+entries (same format as `generateVmData()` in the Java layer).  Each `content`
+value is a plain UTF-8 string.  Writes files under
+`${STATE_DIR}/network-<id>/metadata/<vm-ip>/latest/`.  After writing, starts or
+reloads both the **apache2 metadata HTTP service** (port 80) and the
+**VR-compatible password server** (port 8080) inside the namespace.
+
+### `save-userdata` / `save-password` / `save-sshkey` / `save-hypervisor-hostname`
+
+Granular variants that write individual VM metadata fields:
+
+```
+network-namespace-wrapper.sh save-userdata       --network-id <id> --ip <vm-ip> --userdata <plain>
+network-namespace-wrapper.sh save-password       --network-id <id> --ip <vm-ip> --password <plain>
+network-namespace-wrapper.sh save-sshkey         --network-id <id> --ip <vm-ip> --sshkey <plain>
+network-namespace-wrapper.sh save-hypervisor-hostname \
+    --network-id <id> --ip <vm-ip> --hypervisor-hostname <name>
+```
+
+Each command writes the relevant file and restarts/reloads apache2 (and
+the password server, for `save-password`).
+
+### `apply-lb-rules`
+
+Apply or revoke load-balancing rules via haproxy inside the namespace.
+
+```
+network-namespace-wrapper.sh apply-lb-rules \
+    --network-id <id>        \
+    --lb-rules <json-array>  \
+    [--vpc-id <vpc-id>]
+```
+
+`--lb-rules` is a JSON array of LB rule objects.  Set `"revoke": true` on a
+rule to remove it.  The wrapper regenerates the haproxy configuration from the
+persistent per-rule JSON files under `${STATE_DIR}/network-<id>/haproxy/` and
+reloads haproxy inside the namespace.  haproxy is stopped when no active rules
+remain.
+
+### `restore-network`
+
+Batch-restore DHCP/DNS/metadata/services for all VMs on a network in a single
+call.  Invoked on network restart to rebuild all state at once instead of N
+per-VM calls.
+
+```
+network-namespace-wrapper.sh restore-network \
+    --network-id <id>          \
+    [--gateway <gw>] [--cidr <cidr>] [--dns <dns>] \
+    [--domain <dom>] [--extension-ip <ip>] [--vpc-id <vpc-id>]
+```
+
+The `restore_data` field in the payload is a JSON object (see
+`buildRestoreNetworkData()` in `NetworkExtensionElement.java`).
+
+### `custom-action`
+
+```
+network-namespace-wrapper.sh custom-action \
+    <payload-file> \
+    <timeout-seconds>
+```
+
+CloudStack now writes the custom-action request to a temporary JSON payload file
+and passes that file to the wrapper script. The payload contains the network or
+VPC identifiers, the action name, the caller-supplied action parameters, and
+the extension detail blobs that used to be forwarded as individual CLI flags.
+
+Expected payload keys:
+
+| JSON key | Description |
+|----------|-------------|
+| `network_id` | Network ID for network-level actions |
+| `vpc_id` | VPC ID for VPC-level actions |
+| `action` | Custom action name |
+| `action-params` | Caller-supplied JSON object for the action |
+| `physical_network_extension_details` | Physical-network extension details JSON |
+| `network_extension_details` | Per-network / per-VPC extension details JSON |
+
+Built-in actions:
+
+| Action | Description |
+|--------|-------------|
+| `reboot-device` | Bounces the guest veth pair (`vh-<vlan>-<id>` down → up) |
+| `dump-config` | Prints namespace IP addresses, iptables rules, and per-network state to stdout |
+| `list-firewall-rules` | List iptables rules inside the namespace |
+| `pbr-create-table` | Create or update a routing-table entry in `/etc/iproute2/rt_tables` |
+| `pbr-delete-table` | Remove a routing-table entry from `/etc/iproute2/rt_tables` |
+| `pbr-list-tables` | List non-comment routing-table entries from `/etc/iproute2/rt_tables` |
+| `pbr-add-route` | Add/replace an `ip route` entry in a specific routing table inside the namespace |
+| `pbr-delete-route` | Delete an `ip route` entry from a specific routing table inside the namespace |
+| `pbr-list-routes` | List routes from one table (or all tables) inside the namespace |
+| `pbr-add-rule` | Add an `ip rule` policy rule mapped to a specific routing table inside the namespace |
+| `pbr-delete-rule` | Delete an `ip rule` policy rule mapped to a specific routing table inside the namespace |
+| `pbr-list-rules` | List policy rules (or only rules for one table) inside the namespace |
+
+PBR action parameter keys (`action-params` JSON in the payload file):
+
+| Action | Required keys | Optional keys |
+|--------|---------------|---------------|
+| `pbr-create-table` | `table-id` (or `id`), `table-name` (or `table`) | — |
+| `pbr-delete-table` | `table-id` or `table-name` | — |
+| `pbr-list-tables` | — | — |
+| `pbr-add-route` | `table`, `route` | — |
+| `pbr-delete-route` | `table`, `route` | — |
+| `pbr-list-routes` | — | `table` |
+| `pbr-add-rule` | `table`, `rule` | — |
+| `pbr-delete-rule` | `table`, `rule` | — |
+| `pbr-list-rules` | — | `table` |
+
+Examples (equivalent to direct Linux commands):
+
+* `{"table-id":"100","table-name":"isp1"}` → `100 isp1`
+* `{"table":"isp1","route":"default via 192.168.1.1 dev eth0"}`
+* `{"table":"vpn1","route":"default dev wg0"}`
+* `{"table":"isp1","rule":"from 10.10.1.0/24"}`
+* `{"table":"vpn1","rule":"to 10.10.2.0/24"}`
+
+To add custom actions, place an executable script at
+`${STATE_DIR}/hooks/custom-action-<name>.sh`
+(e.g. `/var/lib/cloudstack/network-namespace/hooks/custom-action-<name>.sh`).
+Unknown action names are delegated to the hook if present; otherwise the command
+fails with a descriptive error.
+
+---
+
+## Payload reference
+
+### Standard payload envelope
+
+```json
+{
+  "physical-network-extension-details": {},
+  "network-extension-details": {},
+  "payload": {}
+}
+```
+
+For `custom-action`, `payload` is not nested; command fields are top-level.
+
+### Top-level extension details
+
+| Top-level key | Description |
+|--------------|-------------|
+| `physical-network-extension-details` | All `extension_resource_map_details` **plus** physical network metadata automatically added by `NetworkExtensionElement` (see table below). |
+| `network-extension-details` | Per-network opaque JSON blob (selected host, namespace). |
+
+### Connection details (keys in `physical-network-extension-details`)
+
+These keys are explicitly set when calling `registerExtension`:
+
+| JSON key | Description |
+|----------|-------------|
+| `hosts` | Comma-separated list of candidate host IPs for HA selection |
+| `host` | Single host IP (used when `hosts` is absent) |
+| `port` | SSH port — default: `22` |
+| `username` | SSH user — default: `root` |
+| `password` | SSH password via `sshpass` — sensitive, not logged |
+| `sshkey` | PEM-encoded SSH private key — sensitive, not logged; preferred over password |
+| `guest.network.device` | Host NIC for guest (internal) traffic, e.g. `eth1` — defaults to `eth1` when absent |
+| `public.network.device` | Host NIC for public (NAT/external) traffic, e.g. `eth1` — defaults to `eth1` when absent |
+
+This key is **automatically injected** by `NetworkExtensionElement` from the
+physical network record:
+
+| JSON key | Description |
+|----------|-------------|
+| `physicalnetworkname` | Physical network name from CloudStack DB |
+
+The wrapper script uses `guest.network.device` (and `public.network.device`) to
+name bridges as `br<eth>-<vlan>` and veth pairs as `vh-<vlan>-<id>` /
+`vn-<vlan>-<id>` (guest) and `vph-<pvlan>-<id>` / `vpn-<pvlan>-<id>` (public).
+
+### Per-network details (keys in `network-extension-details`)
+
+| JSON key | Description |
+|----------|-------------|
+| `host` | Previously selected host IP (set by `ensure-network-device`) |
+| `namespace` | Linux network namespace name (e.g. `cs-net-<networkId>` or `cs-vpc-<vpcId>`) |
+
+### Common keys inside `payload` (standard commands)
+
+#### Network-level fields
+
+| `payload` key | Description |
+|--------------|-------------|
+| `network_id` | Network ID — `CHOSEN_ID` for veth names is `<vpc_id>` when VPC, else `<network_id>` |
+| `vlan` | Guest VLAN tag |
+| `zone_id` | CloudStack zone ID |
+| `guest_type` | Guest network type: `"isolated"`, `"shared"`, or `"l2"`. The wrapper uses this to skip iptables / NAT / public-veth operations for `shared` networks. |
+| `network_state` | Guest network state: `"allocated"`, `"setup"`, `"implementing"`, `"implemented"`, `"shutdown"` or `"destroy"`. |
+| `gateway` | Guest network gateway |
+| `cidr` | Guest network CIDR |
+| `vpc_id` | Present when the network belongs to a VPC; namespace becomes `cs-vpc-<vpcId>` |
+| `network_ip6_gateway` | Guest IPv6 gateway address (assigned to the namespace veth), when configured |
+| `network_ip6_cidr` | Guest IPv6 CIDR (e.g. `2001:db8:1::/64`), when configured |
+| `extension_ip` | IP for DHCP/DNS/metadata service — equals gateway when SourceNat/Gateway is active, otherwise a dedicated placeholder IP |
+| `dns` | Comma-separated IPv4 DNS server list |
+| `dns6` | Comma-separated IPv6 DNS server list (advertised via RDNSS in radvd RA) |
+| `domain` | Network domain suffix |
+| `current_details` | `ensure-network-device` only — previous selected-device JSON, used to preserve host affinity |
+
+#### NIC-level fields
+
+| `payload` key | Description |
+|--------------|-------------|
+| `nic_id` | CloudStack numeric NIC ID |
+| `nic_uuid` | NIC UUID — matches `external_ids:iface-id` written by the KVM agent |
+| `mac` | VM NIC MAC address |
+| `ip` | VM NIC IPv4 address |
+| `gateway` | VM NIC IPv4 gateway |
+| `netmask` | VM NIC IPv4 netmask |
+| `default_nic` | `"false"` for secondary NICs (gateway DHCP option suppressed) |
+| `device_id` | NIC device slot index |
+| `ip6_address` | VM NIC IPv6 address, when configured |
+| `ip6_gateway` | VM NIC IPv6 gateway, when available |
+| `ip6_cidr` | VM NIC IPv6 CIDR, when available |
+
+#### Public-IP fields
+
+| `payload` key | Description |
+|--------------|-------------|
+| `public_ip` | Public IP address |
+| `public_vlan` | Public IP VLAN tag |
+| `public_gateway` | Gateway of the public IP segment |
+| `public_cidr` | CIDR of the public IP |
+| `source_nat` | `"true"` when this IP is the source-NAT IP |
+| `private_ip` | VM private IP (NAT target) |
+
+### Action parameters (custom-action only)
+
+Custom-action parameters are embedded in the JSON payload file under
+`action-params`. Hook scripts should read and decode the payload file directly
+instead of expecting individual `--action-params` CLI arguments.
+
+Example payload excerpt:
+
+```json
+{
+  "action": "dump-config",
+  "network_id": "123",
+  "action-params": {
+    "key1": "value1",
+    "key2": "value2"
+  }
+}
+```
+
+---
+
+## Custom actions
+
+Define custom actions per extension via the CloudStack API:
+
+```bash
+# Add a custom action to the extension
+cmk addCustomAction \
+    extensionid=<ext-uuid> \
+    name=dump-config \
+    description="Dump iptables rules and bridge state" \
+    resourcetype=Network
+```
+
+Trigger the action on a network, optionally with parameters:
+```bash
+cmk runNetworkCustomAction \
+    networkid=<network-uuid> \
+    actionid=<custom-action-uuid> \
+    "parameters[0].key=threshold" "parameters[0].value=90"
+```
+
+### PBR custom-action examples
+
+```bash
+# 1) Create action definitions (once per extension)
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-create-table resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-add-route    resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-add-rule     resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-list-tables  resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-list-routes  resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-list-rules   resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-delete-rule  resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-delete-route resourcetype=Network
+cmk addCustomAction extensionid=<ext-uuid> name=pbr-delete-table resourcetype=Network
+
+# 2) Execute against a network
+cmk runNetworkCustomAction networkid=<network-uuid> actionid=<pbr-create-table-id> \
+    "parameters[0].key=table-id" "parameters[0].value=100" \
+    "parameters[1].key=table-name" "parameters[1].value=isp1"
+
+cmk runNetworkCustomAction networkid=<network-uuid> actionid=<pbr-add-route-id> \
+    "parameters[0].key=table" "parameters[0].value=isp1" \
+    "parameters[1].key=route" "parameters[1].value=default via 192.168.1.1 dev eth0"
+
+cmk runNetworkCustomAction networkid=<network-uuid> actionid=<pbr-add-rule-id> \
+    "parameters[0].key=table" "parameters[0].value=isp1" \
+    "parameters[1].key=rule" "parameters[1].value=from 10.10.1.0/24"
+```
+
+CloudStack calls `NetworkExtensionElement.runCustomAction()`, which issues:
+```bash
+network-namespace.sh custom-action \
+    <payload-file> \
+    <timeout-seconds>
+```
+
+`network-namespace.sh` SSHes to the device and runs `network-namespace-wrapper.sh`
+with the same `<command> <payload-file> <timeout-seconds>` shape. The wrapper
+extracts `action`, `action-params`, and extension-details fields from the payload.
+
+---
+
+## Developer / testing notes
+
+### VPC Support
+
+The extension now supports **VPC (Virtual Private Cloud)** networks in addition to
+isolated networks.  Key differences from isolated networks:
+
+* **Namespace sharing**: All tiers of a VPC share a single namespace (`cs-vpc-<vpcId>`)
+  instead of each network getting its own (`cs-net-<networkId>`).
+* **Host affinity**: All tiers of a VPC land on the same KVM host via stable hash-based
+  selection using the VPC ID as the routing key.
+* **VPC-level operations**: `implement-vpc`, `update-vpc-source-nat-ip`,
+  `shutdown-vpc`, `destroy-vpc` commands
+  manage VPC-wide state (namespace creation/teardown).
+* **VPC tier operations**: `implement-network`, `shutdown-network`, `destroy-network`
+  commands manage per-tier bridges and routes; the namespace is preserved across
+  tier lifecycle operations.
+
+### Integration tests
+
+The integration smoke test at
+`test/integration/smoke/test_network_extension_namespace.py`
+exercises the full lifecycle against real KVM hosts in the zone.
+
+```
+Management server
+  └── /usr/share/cloudstack-management/extensions/<ext-name>/
+        └── network-namespace.sh             ← deployed / referenced by test
+              SSHes to KVM host
+              runs network-namespace-wrapper.sh <cmd> <args>
+
+KVM host(s) in the zone
+  └── /etc/cloudstack/extensions/<ext-name>/
+        └── network-namespace-wrapper.sh     ← copied to KVM hosts by test setup
+              creates cs-net-<id> or cs-vpc-<id> namespaces
+              manages bridges, veth pairs, iptables, dnsmasq, haproxy, apache2
+```
+
+The test covers:
+* Create / list / update / delete external network device.
+* Full network lifecycle: implement → assign-ip (source NAT) → static NAT →
+  port forwarding → firewall rules → DHCP/DNS → shutdown / destroy.
+* VPC multi-tier networks with shared namespace and automatic host affinity.
+* VPC source NAT IP update flow (`test_09_vpc_source_nat_ip_update`) including
+  source NAT flag flip from old public IP to new public IP.
+* NSP state transitions: Disabled → Enabled → Disabled → Deleted.
+* Tests `test_04`, `test_05`, `test_06` (DHCP, DNS, LB) require `arping`,
+  `dnsmasq`, and `haproxy` on the KVM hosts; the test skips them automatically
+  if these tools are not installed.
+* Script cleanup on both management server and KVM hosts after each test.
+
+Run the test:
+```bash
+cd test/integration/smoke
+python -m pytest test_network_extension_namespace.py \
+    --with-marvin --marvin-config=<config.cfg> \
+    -s -a 'tags=advanced,smoke' 2>&1 | tee /tmp/extnet-test.log
+```
+
+**Prerequisites on KVM hosts:**
+* `iproute2` (`ip`, `ip netns`)
+* `iptables` + `iptables-save`
+* `arping` (for GARP on IP assignment)
+* `dnsmasq` (DHCP + DNS — required for `test_04` / DNS tests)
+* `haproxy` (LB — required for `test_05` / LB tests)
+* `apache2` / `httpd` (metadata HTTP service — required for UserData tests)
+* `python3` (vm-data processing, haproxy config generation)
+* `util-linux` (`flock`) (lock serialization)
+* SSH access from management server (root or sudo-capable user)
+
+**Prerequisites on the Marvin / test runner node:**
+* Python Marvin library installed (`pip install -r requirements.txt`)
+* A valid Marvin config file pointing to the CloudStack environment
+* The test runner must be able to SSH to the management server and to KVM hosts
