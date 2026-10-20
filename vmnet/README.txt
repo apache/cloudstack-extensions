@@ -35,7 +35,15 @@ first time an instance needs it, attaches the NIC to it, and deletes the
 network with its last instance.
 
 Orchestrator extensions that read these URIs:
-  apple-container   container networks ("container network create")
+  apple-container   container networks ("container network create"), modes
+                    nat and internal
+  UTM               QEMU vmnet host-only segments ("vmnet-host,net-uuid=",
+                    QEMU backend), with a UUID derived from the network
+                    name; mode internal only
+
+Each orchestrator attaches its instances to its own kind of vmnet network,
+so container and UTM instances on the same CloudStack network do not reach
+each other.
 
 Requirements
 ------------
