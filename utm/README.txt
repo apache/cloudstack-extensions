@@ -51,9 +51,13 @@ Supported operations
   create          Clone the template VM (APFS clone, so it is cheap), name it
                   after the CloudStack instance's internal name, set CPU
                   cores, memory and NIC MAC addresses, then start it. The
-                  clone is removed again when any step fails.
+                  clone is removed again when any step fails. See Networks
+                  for how the NICs are connected.
   start, stop, reboot, delete, status, statuses
-  getconsole      Not supported, UTM has no VNC endpoint to hand out.
+  getconsole      Only with console_url set (see Configuration details):
+                  returns console_url with the instance's websocket port and
+                  name as a direct console. The QEMU console arguments are
+                  applied when the VM is created or started while stopped.
 
 Custom actions (register them with addCustomAction, no parameters):
   Suspend         Pause the VM in memory
@@ -79,10 +83,50 @@ Extension or host details (host details win):
                     otherwise template NICs keep their mode and additional
                     NICs use shared
   bridge_interface  macOS interface for bridged mode, e.g. en0
+  isolated_network_uuid
+                    Optional UUID of a private vmnet host-only segment (QEMU
+                    backend). When set, NICs that are not on a vmnet
+                    extension network are attached to it instead of using
+                    network_mode; VMs with the same UUID share one L2
+                    segment without DHCP server or host address
   wait_timeout      Optional, seconds to wait for state changes, default 120
+  console_url       Optional URL of a noVNC page that takes ?port=<websocket
+                    port>. When set, each instance gets a QEMU VNC server on
+                    127.0.0.1 with a websocket, showing its serial console as
+                    a text console, and getconsole returns this URL as a
+                    direct console (QEMU backend only)
+  console_websocket_base
+                    Optional, websocket port = this + instance id, default 5700
+  console_vnc_display_base
+                    Optional, VNC display = this + instance id, default 200
 
 Template, service offering or instance details:
   template_name     UTM VM to clone, overrides the host/extension value
+
+Networks
+--------
+
+Without further configuration the NICs use UTM's network modes (see
+network_mode). The QEMU backend can also attach them to private vmnet
+host-only segments: L2 segments on the Mac, without DHCP server and without
+a host address, that only VMs with the same segment UUID share.
+
+  - A NIC on a CloudStack network of the vmnet network extension (an L2
+    network whose broadcast URI looks like vs://cs-net-42?mode=internal,
+    see the vmnet extension's README.txt) gets a segment of its own, with a
+    UUID derived from the network name. All instances on that CloudStack
+    network on the same Mac share it, and other networks cannot reach it.
+    Only mode internal is supported, deploying to a nat network fails.
+  - With isolated_network_uuid set, the other NICs are attached to that
+    segment, e.g. one served by a router VM.
+  - Otherwise, when at least one NIC is on a vmnet extension network, the
+    other NICs use vmnet-shared, vmnet-host or vmnet-bridged according to
+    network_mode (emulated is not supported then).
+
+These NICs are passed to QEMU as additional arguments (-netdev/-device with
+ids csnic1, csnic2, ...) in place of UTM's network interfaces. Guests need
+their addresses configured by other means than DHCP, for instance a second
+NIC on a network with DHCP.
 
 Setup
 -----
@@ -119,9 +163,12 @@ Limitations
 
   - No VLAN isolation: UTM cannot tag VLANs. Instances get the CloudStack
     MAC addresses and the configured network mode only, so the guest network
-    must be reachable through the Mac's shared or bridged networking.
-  - No console access and no snapshots (neither is exposed by utmctl or
-    UTM's AppleScript dictionary).
+    must be reachable through the Mac's shared or bridged networking, unless
+    vmnet extension networks or isolated_network_uuid are used (see
+    Networks), which are local to one Mac.
+  - No snapshots (not exposed by utmctl or UTM's AppleScript dictionary).
+  - Console access only through console_url, as a text console on the
+    guest's serial port, and only for the QEMU backend.
   - The UTM VM name equals the CloudStack internal instance name; renaming
     the VM in UTM breaks the mapping.
   - Tested against UTM 4.6.4 (clone, configure, status, delete). Starting
