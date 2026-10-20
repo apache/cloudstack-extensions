@@ -215,7 +215,7 @@ REMOTE_SCRIPT="${CS_NET_SCRIPT_PATH:-${DEFAULT_SCRIPT_PATH}}"
 REMOTE_PORT=$(json_get "${PHYS_DETAILS}" "port")
 REMOTE_USER=$(json_get "${PHYS_DETAILS}" "username")
 REMOTE_PASS=$(json_get "${PHYS_DETAILS}" "password")
-REMOTE_SSHKEY=$(json_get "${PHYS_DETAILS}" "sshkey")
+REMOTE_SSHKEY=$(printf '%b' "$(json_get "${PHYS_DETAILS}" "sshkey")")
 HOSTS_CSV=$(json_get "${PHYS_DETAILS}" "hosts")
 SINGLE_HOST=$(json_get "${PHYS_DETAILS}" "host")
 
